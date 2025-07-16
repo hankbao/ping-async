@@ -1,6 +1,6 @@
 [package]
 name = "ping-async"
-version = "0.1.1"
+version = "0.1.2"
 authors = ["hankbao <hankbao84@gmail.com>"]
 license = "MIT"
 description = "Unprivileged Async Ping"
@@ -38,4 +38,3 @@ tokio = { version = "1.36", features = ["macros", "net", "rt", "time"] }
 
 [dev-dependencies]
 tokio = { version = "1.36", features = ["macros", "rt-multi-thread", "time"] }
-tokio-stream = { version = "0.1", features = ["time"] }

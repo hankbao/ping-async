@@ -163,10 +163,19 @@ impl IcmpEchoRequestor {
 
             let size = socket.recv(&mut buf).await?;
             let payload: Box<[u8]>;
-            if target.is_ipv4() {
-                // skip the IP header for icmp
-                payload = Vec::from(&buf[20..size]).into_boxed_slice();
-            } else {
+
+            #[cfg(target_os = "macos")]
+            {
+                if target.is_ipv4() {
+                    // skip the IP header for icmp on macOS
+                    payload = Vec::from(&buf[20..size]).into_boxed_slice();
+                } else {
+                    payload = Vec::from(&buf[..size]).into_boxed_slice();
+                }
+            }
+
+            #[cfg(target_os = "linux")]
+            {
                 payload = Vec::from(&buf[..size]).into_boxed_slice();
             }
 

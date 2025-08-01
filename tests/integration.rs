@@ -40,8 +40,7 @@ async fn test_high_concurrency() {
     let success_count = results.iter().filter(|r| r.is_ok()).count();
     assert!(
         success_count > 40,
-        "Most loopback pings should succeed, got {}/50",
-        success_count
+        "Most loopback pings should succeed, got {success_count}/50"
     );
 }
 
@@ -53,7 +52,7 @@ async fn test_rapid_firing() {
     // Rapid fire requests to stress callback unregistration
     for i in 0..20 {
         let result = req.send().await;
-        assert!(result.is_ok(), "Request {} should succeed", i);
+        assert!(result.is_ok(), "Request {i} should succeed");
     }
 }
 
@@ -122,7 +121,7 @@ async fn test_icmp_creation() {
         }
         (Err(e), _) | (_, Err(e)) => {
             // Might not have permissions
-            println!("ICMP creation failed (may need elevation): {}", e);
+            println!("ICMP creation failed (may need elevation): {e}");
             // Don't fail the test - this is informational
         }
     }

@@ -23,7 +23,7 @@ async fn ping(dest: IpAddr, times: usize) -> io::Result<()> {
     let pinger = match IcmpEchoRequestor::new(dest, None, None, None) {
         Ok(req) => req,
         Err(e) => {
-            eprintln!("Error creating pinger: {}", e);
+            eprintln!("Error creating pinger: {e}");
             return Err(e);
         }
     };
@@ -41,7 +41,7 @@ async fn ping(dest: IpAddr, times: usize) -> io::Result<()> {
                 reply.round_trip_time()
             ),
             Err(e) => {
-                eprintln!("Error sending ping: {}", e);
+                eprintln!("Error sending ping: {e}");
                 return Err(e);
             }
         }

@@ -20,14 +20,14 @@
 //! async fn main() -> std::io::Result<()> {
 //!     let target = "8.8.8.8".parse::<IpAddr>().unwrap();
 //!     let pinger = IcmpEchoRequestor::new(target, None, None, None)?;
-//!     
+//!
 //!     let reply = pinger.send().await?;
 //!     println!("Reply from {}: {:?} in {:?}",
 //!         reply.destination(),
 //!         reply.status(),
 //!         reply.round_trip_time()
 //!     );
-//!     
+//!
 //!     Ok(())
 //! }
 //! ```
@@ -150,7 +150,7 @@ mod tests {
         let reply = pinger.send().await?;
 
         assert_eq!(reply.destination(), "127.0.0.1".parse::<IpAddr>().unwrap());
-        println!("IPv4 ping result: {:?}", reply);
+        println!("IPv4 ping result: {reply:?}");
 
         Ok(())
     }
@@ -161,7 +161,7 @@ mod tests {
         let reply = pinger.send().await?;
 
         assert_eq!(reply.destination(), "::1".parse::<IpAddr>().unwrap());
-        println!("IPv6 ping result: {:?}", reply);
+        println!("IPv6 ping result: {reply:?}");
 
         Ok(())
     }

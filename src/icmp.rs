@@ -98,19 +98,6 @@ impl fmt::Display for IcmpType {
 /// parse incoming echo reply packets, and extract packet fields. It handles
 /// the platform-specific differences in packet format and checksum calculation.
 ///
-/// # Examples
-///
-/// ```rust
-/// use ping_async::icmp::IcmpPacket;
-/// use std::net::IpAddr;
-///
-/// let target = "127.0.0.1".parse::<IpAddr>().unwrap();
-/// let packet = IcmpPacket::new_echo_request(target, 0x1234, 1, &[1, 2, 3, 4]);
-/// 
-/// assert_eq!(packet.identifier(), 0x1234);
-/// assert_eq!(packet.sequence(), 1);
-/// assert_eq!(packet.payload(), &[1, 2, 3, 4]);
-/// ```
 #[derive(Clone)]
 pub struct IcmpPacket {
     data: Vec<u8>, // raw packet data

@@ -4,9 +4,7 @@ use std::io;
 use std::net::IpAddr;
 use std::time::Duration;
 
-use futures::{channel::mpsc, StreamExt};
 use ping_async::IcmpEchoRequestor;
-
 use tokio::time;
 
 #[tokio::main]
@@ -22,37 +20,31 @@ async fn main() {
 }
 
 async fn ping(dest: IpAddr, times: usize) -> io::Result<()> {
-    let (tx, mut rx) = mpsc::unbounded();
-
-    let pinger = match IcmpEchoRequestor::new(tx, dest, None, None, None) {
+    let pinger = match IcmpEchoRequestor::new(dest, None, None, None) {
         Ok(req) => req,
         Err(e) => {
-            eprintln!("Error in new: {}", e);
+            eprintln!("Error creating pinger: {}", e);
             return Err(e);
         }
     };
 
+    let mut interval = time::interval(Duration::from_secs(1));
+
     for _ in 0..times {
-        if let Err(e) = pinger.send().await {
-            eprintln!("Error in send: {}", e);
-            return Err(e);
-        }
+        interval.tick().await;
 
-        match rx.next().await {
-            Some(reply) => {
-                println!(
-                    "Reply from {}: status = {:?}, time = {:?}",
-                    reply.destination(),
-                    reply.status(),
-                    reply.round_trip_time()
-                );
-            }
-            None => {
-                eprintln!("channel is closed.");
+        match pinger.send().await {
+            Ok(reply) => println!(
+                "Reply from {}: status = {:?}, time = {:?}",
+                reply.destination(),
+                reply.status(),
+                reply.round_trip_time()
+            ),
+            Err(e) => {
+                eprintln!("Error sending ping: {}", e);
+                return Err(e);
             }
         }
-
-        time::sleep(Duration::from_secs(1)).await;
     }
 
     Ok(())

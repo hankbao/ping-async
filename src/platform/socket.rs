@@ -467,8 +467,7 @@ fn create_socket(
         let local_addr = socket.local_addr()?;
         local_addr
             .as_socket()
-            .ok_or(io::Error::new(
-                io::ErrorKind::Other,
+            .ok_or(io::Error::other(
                 "Failed to get kernel-assigned ICMP identifier",
             ))?
             .port()

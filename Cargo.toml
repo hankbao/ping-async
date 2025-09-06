@@ -1,6 +1,6 @@
 [package]
 name = "ping-async"
-version = "1.0.0"
+version = "1.0.1"
 authors = ["hankbao <hankbao84@gmail.com>"]
 license = "MIT"
 description = "Unprivileged Async Ping"

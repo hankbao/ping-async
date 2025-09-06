@@ -10,7 +10,6 @@ use std::sync::{
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::channel::oneshot;
-use rand::random;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::{net::UdpSocket, time};
 
@@ -51,10 +50,10 @@ struct RouterContext {
 /// async fn main() -> std::io::Result<()> {
 ///     let target = "8.8.8.8".parse::<IpAddr>().unwrap();
 ///     let pinger = IcmpEchoRequestor::new(target, None, None, None)?;
-///     
+///
 ///     let reply = pinger.send().await?;
 ///     println!("Reply: {:?}", reply);
-///     
+///
 ///     Ok(())
 /// }
 /// ```
@@ -139,10 +138,10 @@ impl IcmpEchoRequestor {
         }
 
         let timeout = timeout.unwrap_or(PING_DEFAULT_TIMEOUT);
-        let identifier = random();
         let sequence = AtomicU16::new(0);
 
-        let socket = Arc::new(create_socket(target_addr, source_addr, ttl)?);
+        let (socket, identifier) = create_socket(target_addr, source_addr, ttl)?;
+        let socket = Arc::new(socket);
         let registry = Arc::new(Mutex::new(HashMap::new()));
 
         // Create a context for the router task
@@ -182,7 +181,7 @@ impl IcmpEchoRequestor {
     ///
     /// Returns an [`IcmpEchoReply`](crate::IcmpEchoReply) containing:
     /// - The destination IP address
-    /// - The status of the ping operation  
+    /// - The status of the ping operation
     /// - The measured round-trip time
     ///
     /// # Errors
@@ -206,11 +205,11 @@ impl IcmpEchoRequestor {
     ///         "8.8.8.8".parse().unwrap(),
     ///         None, None, None
     ///     )?;
-    ///     
+    ///
     ///     // Send multiple pings using the same requestor
     ///     for i in 0..3 {
     ///         let reply = pinger.send().await?;
-    ///         
+    ///
     ///         match reply.status() {
     ///             IcmpEchoStatus::Success => {
     ///                 println!("Ping {}: {:?}", i, reply.round_trip_time());
@@ -223,7 +222,7 @@ impl IcmpEchoRequestor {
     ///             }
     ///         }
     ///     }
-    ///     
+    ///
     ///     Ok(())
     /// }
     /// ```
@@ -364,7 +363,6 @@ async fn reply_router_loop(
 
                 if let Some(reply_packet) = IcmpPacket::parse_reply(&buf, target_addr) {
                     // Check if this is a reply to our request by comparing identifier, ignoring if not
-                    // identifier may be rewritten by some implementations (e.g., Linux on Docker Mac)
                     if reply_packet.identifier() != identifier {
                         continue;
                     }
@@ -432,7 +430,7 @@ fn create_socket(
     target_addr: IpAddr,
     source_addr: Option<IpAddr>,
     ttl: Option<u8>,
-) -> io::Result<UdpSocket> {
+) -> io::Result<(UdpSocket, u16)> {
     let socket = match target_addr {
         IpAddr::V4(_) => Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::ICMPV4))?,
         IpAddr::V6(_) => Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::ICMPV6))?,
@@ -446,12 +444,38 @@ fn create_socket(
         socket.set_unicast_hops_v6(ttl as u32)?;
     }
 
-    // Bind the socket to the source address if provided
-    if let Some(source_addr) = source_addr {
-        socket.bind(&SocketAddr::new(source_addr, 0).into())?;
-    }
+    #[cfg(not(target_os = "linux"))]
+    let identifier = {
+        // On macOS, use random identifier and bind to source address if provided
+        if let Some(source_addr) = source_addr {
+            socket.bind(&SocketAddr::new(source_addr, 0).into())?;
+        }
+        rand::random()
+    };
 
-    UdpSocket::from_std(socket.into())
+    // Platform-specific identifier and binding logic
+    #[cfg(target_os = "linux")]
+    let identifier = {
+        // On Linux, bind with port 0 to let kernel assign ICMP identifier
+        let bind_addr = source_addr.unwrap_or(match target_addr {
+            IpAddr::V4(_) => IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            IpAddr::V6(_) => IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+        });
+        socket.bind(&SocketAddr::new(bind_addr, 0).into())?;
+
+        // Get kernel-assigned identifier from getsockname
+        let local_addr = socket.local_addr()?;
+        local_addr
+            .as_socket()
+            .ok_or(io::Error::new(
+                io::ErrorKind::Other,
+                "Failed to get kernel-assigned ICMP identifier",
+            ))?
+            .port()
+    };
+
+    let udp_socket = UdpSocket::from_std(socket.into())?;
+    Ok((udp_socket, identifier))
 }
 
 #[cfg(test)]

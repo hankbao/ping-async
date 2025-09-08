@@ -444,6 +444,12 @@ fn create_socket(
         socket.set_unicast_hops_v6(ttl as u32)?;
     }
 
+    // Platform-specific ICMP identifier handling
+    //
+    // macOS/BSD systems preserve the ICMP identifier field throughout the ping process.
+    // When we send an ICMP ECHO request with a specific identifier (e.g., 6789),
+    // the reply will contain the same identifier value. This allows us to use
+    // random identifiers for distinguishing between different ping sessions.
     #[cfg(not(target_os = "linux"))]
     let identifier = {
         // On macOS, use random identifier and bind to source address if provided
@@ -453,17 +459,27 @@ fn create_socket(
         rand::random()
     };
 
-    // Platform-specific identifier and binding logic
+    // Linux systems behave differently with unprivileged ICMP sockets (SOCK_DGRAM).
+    // The Linux kernel automatically replaces the ICMP identifier field with the
+    // socket's local port number. This means:
+    // 1. Any identifier we set will be ignored and replaced by the kernel
+    // 2. ICMP replies are routed back based on the socket port, not the identifier
+    // 3. We must bind the socket to get a port assignment from the kernel
+    // 4. The port number becomes our effective identifier for matching replies
+    //
+    // This behavior ensures proper delivery of ICMP replies to the correct socket
+    // in a multi-process environment, since the kernel handles routing internally.
     #[cfg(target_os = "linux")]
     let identifier = {
-        // On Linux, bind with port 0 to let kernel assign ICMP identifier
+        // Bind with port 0 to let kernel assign a unique port number.
+        // This port will be used as the ICMP identifier by the kernel.
         let bind_addr = source_addr.unwrap_or(match target_addr {
             IpAddr::V4(_) => IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
             IpAddr::V6(_) => IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
         });
         socket.bind(&SocketAddr::new(bind_addr, 0).into())?;
 
-        // Get kernel-assigned identifier from getsockname
+        // Extract the kernel-assigned port number, which will be used as the ICMP identifier
         let local_addr = socket.local_addr()?;
         local_addr
             .as_socket()

@@ -19,11 +19,31 @@ use crate::{
 
 type RequestRegistry = Arc<Mutex<HashMap<u16, oneshot::Sender<IcmpEchoReply>>>>;
 
+/// Persistent record of a fatal router error, stored so that all subsequent
+/// `send()` calls fail fast with the same error information.
+struct RouterError {
+    kind: io::ErrorKind,
+    message: String,
+}
+
+impl RouterError {
+    fn from_io_error(e: &io::Error) -> Self {
+        RouterError {
+            kind: e.kind(),
+            message: e.to_string(),
+        }
+    }
+
+    fn to_io_error(&self) -> io::Error {
+        io::Error::new(self.kind, self.message.clone())
+    }
+}
+
 struct RouterContext {
     target_addr: IpAddr,
     socket: Arc<UdpSocket>,
     registry: RequestRegistry,
-    failed: Arc<Mutex<Option<io::Error>>>,
+    failed: Arc<Mutex<Option<RouterError>>>,
 }
 
 /// Requestor for sending ICMP Echo Requests (ping) and receiving replies on Unix systems.
@@ -149,7 +169,7 @@ impl IcmpEchoRequestor {
             target_addr,
             socket: Arc::clone(&socket),
             registry: Arc::clone(&registry),
-            failed: Arc::new(Mutex::new(None)),
+            failed: Arc::new(Mutex::new(None::<RouterError>)),
         };
 
         Ok(IcmpEchoRequestor {
@@ -227,16 +247,15 @@ impl IcmpEchoRequestor {
     /// }
     /// ```
     pub async fn send(&self) -> io::Result<IcmpEchoReply> {
-        // Check if router failed already
-        if let Some(failed) = self
+        // Check if router failed already — error is persistent, not consumed
+        if let Some(ref router_error) = *self
             .inner
             .router_context
             .failed
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
         {
-            return Err(failed);
+            return Err(router_error.to_io_error());
         }
 
         // lazy spawning
@@ -259,32 +278,35 @@ impl IcmpEchoRequestor {
             &payload,
         );
 
+        // Register in the registry BEFORE sending so fast replies (e.g. loopback)
+        // are not dropped by the router due to a missing entry.
+        let (tx, reply_rx) = oneshot::channel();
+        self.inner
+            .registry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key, tx);
+
         let target = SocketAddr::new(self.inner.target_addr, 0);
-        let reply_rx = match self.inner.socket.send_to(packet.as_bytes(), target).await {
-            Ok(_) => {
-                let (tx, rx) = oneshot::channel();
+        if let Err(e) = self.inner.socket.send_to(packet.as_bytes(), target).await {
+            // Send failed — remove the registry entry we just inserted
+            self.inner
+                .registry
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&key);
 
-                self.inner
-                    .registry
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .insert(key, tx);
-
-                rx
-            }
-            Err(e) => match e.kind() {
+            return match e.kind() {
                 io::ErrorKind::NetworkUnreachable
                 | io::ErrorKind::NetworkDown
-                | io::ErrorKind::HostUnreachable => {
-                    return Ok(IcmpEchoReply::new(
-                        self.inner.target_addr,
-                        IcmpEchoStatus::Unreachable,
-                        Duration::ZERO,
-                    ));
-                }
-                _ => return Err(e),
-            },
-        };
+                | io::ErrorKind::HostUnreachable => Ok(IcmpEchoReply::new(
+                    self.inner.target_addr,
+                    IcmpEchoStatus::Unreachable,
+                    Duration::ZERO,
+                )),
+                _ => Err(e),
+            };
+        }
 
         let timeout = self.inner.timeout;
         let target_addr = self.inner.target_addr;
@@ -294,8 +316,18 @@ impl IcmpEchoRequestor {
                 match result {
                     Ok(reply) => Ok(reply),
                     Err(_) => {
-                        // Channel closed - router probably failed
-                        Err(io::Error::other("reply channel closed"))
+                        // Channel closed — check if router failed for a consistent error
+                        if let Some(ref router_error) = *self
+                            .inner
+                            .router_context
+                            .failed
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        {
+                            Err(router_error.to_io_error())
+                        } else {
+                            Err(io::Error::other("reply channel closed"))
+                        }
                     }
                 }
             }
@@ -308,7 +340,7 @@ impl IcmpEchoRequestor {
                     .duration_since(UNIX_EPOCH)
                     .map_err(|e| io::Error::other(format!("timestamp error: {e}")))?
                     .as_nanos() as u64;
-                let rtt = Duration::from_nanos(now - timestamp);
+                let rtt = Duration::from_nanos(now.saturating_sub(timestamp));
 
                 Ok(IcmpEchoReply::new(
                     target_addr,
@@ -352,7 +384,7 @@ async fn reply_router_loop(
     identifier: u16,
     socket: Arc<UdpSocket>,
     registry: RequestRegistry,
-    failed: Arc<Mutex<Option<io::Error>>>,
+    failed: Arc<Mutex<Option<RouterError>>>,
 ) {
     loop {
         let mut buf = vec![0u8; 1024];
@@ -399,6 +431,23 @@ async fn reply_router_loop(
                         // Send reply to waiting thread
                         let _ = sender.send(reply);
                     }
+                } else if let Some(error_info) = IcmpPacket::parse_error_reply(&buf, target_addr) {
+                    // ICMP error message (Dest Unreachable, Time Exceeded) with
+                    // embedded echo request — match by identifier and sequence.
+                    if error_info.identifier != identifier {
+                        continue;
+                    }
+
+                    let sender = registry
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(&error_info.sequence);
+
+                    if let Some(sender) = sender {
+                        let reply =
+                            IcmpEchoReply::new(target_addr, error_info.status, Duration::ZERO);
+                        let _ = sender.send(reply);
+                    }
                 }
             }
             Err(e) => {
@@ -408,12 +457,15 @@ async fn reply_router_loop(
                     io::ErrorKind::AddrNotAvailable |        // Address no longer available
                     io::ErrorKind::ConnectionAborted |       // Socket forcibly closed
                     io::ErrorKind::NotConnected => {         // Socket disconnected
-                        // Clear pending requests so they don't hang
-                        registry.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clear();
-
-                        // Mark the failed flag
+                        // Store the error persistently so all future send() calls fail fast
                         let mut failed_lock = failed.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                        *failed_lock = Some(e);
+                        *failed_lock = Some(RouterError::from_io_error(&e));
+
+                        // Drain the registry — dropping senders closes channels, which
+                        // causes in-flight send() calls to see Canceled and check `failed`
+                        // for a consistent error. Entries already removed by timeout are
+                        // simply absent.
+                        registry.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clear();
 
                         return;
                     }

@@ -6,6 +6,8 @@ This crate can send unprivileged ICMP echo requests and receive echo replies asy
 
 On Windows, it uses the `IcmpSendEcho2Ex` and `Icmp6SendEcho2` win32 API. On macOS and Linux, it uses the ICMP sockets with the help of `tokio`. Due to the latter's asynchronous nature, the time accuracy could be affected by the system's load.
 
+A `tokio` runtime with the time driver enabled is required on all platforms: the configured timeout is enforced by `tokio::time`, so a request resolves within the timeout even when the operating system keeps it pending longer.
+
 ## Example
 
 ```bash

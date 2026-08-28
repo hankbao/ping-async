@@ -92,16 +92,28 @@ async fn test_timeout_behavior() {
     let result = req.send().await.unwrap();
     let elapsed = start.elapsed();
 
-    // Should timeout within reasonable time
-    assert_eq!(result.status(), IcmpEchoStatus::TimedOut);
-    assert!(
-        elapsed >= Duration::from_millis(500),
-        "Should wait at least 500ms"
-    );
-    assert!(
-        elapsed < Duration::from_millis(1500),
-        "Should timeout within 1s"
-    );
+    match result.status() {
+        // No reply at all: the local timeout must fire, and within reasonable time.
+        IcmpEchoStatus::TimedOut => {
+            assert!(
+                elapsed >= Duration::from_millis(500),
+                "Should wait at least 500ms"
+            );
+            assert!(
+                elapsed < Duration::from_millis(1500),
+                "Should timeout within 1s"
+            );
+        }
+        // A gateway that rejects the documentation prefix answers with an ICMP error,
+        // which is delivered as Unreachable — before the local timeout, on every platform.
+        IcmpEchoStatus::Unreachable => {
+            assert!(
+                elapsed < Duration::from_millis(1500),
+                "ICMP error must arrive before the local timeout"
+            );
+        }
+        other => panic!("unexpected status {other:?} for a black-hole address"),
+    }
 }
 
 /// Test behavior when creating requestor (checks for permission issues)

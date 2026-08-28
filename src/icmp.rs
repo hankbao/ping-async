@@ -367,27 +367,14 @@ impl IcmpPacket {
         }
 
         let icmp_data = &data[outer_offset..];
-        let icmp_type = icmp_data[0];
 
         // Determine status from ICMP error type
-        let status = if target_addr.is_ipv4() {
-            match icmp_type {
-                ICMPV4_DEST_UNREACHABLE => IcmpEchoStatus::Unreachable,
-                ICMPV4_TIME_EXCEEDED => IcmpEchoStatus::TimedOut,
-                _ => return None,
-            }
-        } else {
-            match icmp_type {
-                ICMPV6_DEST_UNREACHABLE => IcmpEchoStatus::Unreachable,
-                ICMPV6_TIME_EXCEEDED => IcmpEchoStatus::TimedOut,
-                _ => return None,
-            }
-        };
+        let status = Self::error_status(target_addr, icmp_data[0])?;
 
         // Skip the 8-byte ICMP error header to reach the embedded original packet
         let embedded = &icmp_data[8..];
 
-        if target_addr.is_ipv4() {
+        let embedded_icmp = if target_addr.is_ipv4() {
             // Embedded IPv4 packet
             if embedded.is_empty() {
                 return None;
@@ -408,18 +395,7 @@ impl IcmpPacket {
             if embedded[9] != IP_PROTO_ICMP {
                 return None;
             }
-            let embedded_icmp = &embedded[embedded_ihl..];
-            // Verify embedded ICMP type is Echo Request
-            if embedded_icmp[0] != ICMPV4_ECHO_REQUEST {
-                return None;
-            }
-            let identifier = u16::from_be_bytes([embedded_icmp[4], embedded_icmp[5]]);
-            let sequence = u16::from_be_bytes([embedded_icmp[6], embedded_icmp[7]]);
-            Some(IcmpErrorInfo {
-                identifier,
-                sequence,
-                status,
-            })
+            &embedded[embedded_ihl..]
         } else {
             // Embedded IPv6 packet
             if embedded.len() < IPV6_HEADER_LEN + 8 {
@@ -433,19 +409,60 @@ impl IcmpPacket {
             if embedded[6] != IP_PROTO_ICMPV6 {
                 return None;
             }
-            let embedded_icmpv6 = &embedded[IPV6_HEADER_LEN..];
-            // Verify embedded ICMPv6 type is Echo Request
-            if embedded_icmpv6[0] != ICMPV6_ECHO_REQUEST {
-                return None;
+            &embedded[IPV6_HEADER_LEN..]
+        };
+
+        let (identifier, sequence) = Self::parse_embedded_echo_request(embedded_icmp, target_addr)?;
+        Some(IcmpErrorInfo {
+            identifier,
+            sequence,
+            status,
+        })
+    }
+
+    /// Maps the type of an ICMP *error* message to the status it means for the echo
+    /// request it embeds: Destination Unreachable -> `Unreachable`, Time Exceeded ->
+    /// `TimedOut`; any other type is not an error we report (`None`).
+    pub fn error_status(target_addr: IpAddr, icmp_type: u8) -> Option<IcmpEchoStatus> {
+        if target_addr.is_ipv4() {
+            match icmp_type {
+                ICMPV4_DEST_UNREACHABLE => Some(IcmpEchoStatus::Unreachable),
+                ICMPV4_TIME_EXCEEDED => Some(IcmpEchoStatus::TimedOut),
+                _ => None,
             }
-            let identifier = u16::from_be_bytes([embedded_icmpv6[4], embedded_icmpv6[5]]);
-            let sequence = u16::from_be_bytes([embedded_icmpv6[6], embedded_icmpv6[7]]);
-            Some(IcmpErrorInfo {
-                identifier,
-                sequence,
-                status,
-            })
+        } else {
+            match icmp_type {
+                ICMPV6_DEST_UNREACHABLE => Some(IcmpEchoStatus::Unreachable),
+                ICMPV6_TIME_EXCEEDED => Some(IcmpEchoStatus::TimedOut),
+                _ => None,
+            }
         }
+    }
+
+    /// Extracts `(identifier, sequence)` from the ICMP header of an embedded echo request
+    /// (as found inside an ICMP error message, or as delivered by the Linux error queue).
+    ///
+    /// `icmp_header` must start at the embedded ICMP header: type at byte 0, identifier at
+    /// bytes 4-5, sequence at bytes 6-7. Returns `None` if it is shorter than 8 bytes or is
+    /// not an echo request of the target address family.
+    pub fn parse_embedded_echo_request(
+        icmp_header: &[u8],
+        target_addr: IpAddr,
+    ) -> Option<(u16, u16)> {
+        if icmp_header.len() < 8 {
+            return None;
+        }
+        let expected = if target_addr.is_ipv4() {
+            ICMPV4_ECHO_REQUEST
+        } else {
+            ICMPV6_ECHO_REQUEST
+        };
+        if icmp_header[0] != expected {
+            return None;
+        }
+        let identifier = u16::from_be_bytes([icmp_header[4], icmp_header[5]]);
+        let sequence = u16::from_be_bytes([icmp_header[6], icmp_header[7]]);
+        Some((identifier, sequence))
     }
 
     /// Returns the platform-specific outer IP header offset for the given data.
@@ -984,5 +1001,76 @@ mod tests {
         packet.extend_from_slice(&make_echo_request_v4(0x1234, 0x0001));
 
         assert!(IcmpPacket::parse_error_reply(&packet, target).is_none());
+    }
+    #[test]
+    fn test_error_status_mapping() {
+        let v4: IpAddr = "127.0.0.1".parse().unwrap();
+        let v6: IpAddr = "::1".parse().unwrap();
+        assert_eq!(
+            IcmpPacket::error_status(v4, ICMPV4_DEST_UNREACHABLE),
+            Some(IcmpEchoStatus::Unreachable)
+        );
+        assert_eq!(
+            IcmpPacket::error_status(v4, ICMPV4_TIME_EXCEEDED),
+            Some(IcmpEchoStatus::TimedOut)
+        );
+        assert_eq!(
+            IcmpPacket::error_status(v6, ICMPV6_DEST_UNREACHABLE),
+            Some(IcmpEchoStatus::Unreachable)
+        );
+        assert_eq!(
+            IcmpPacket::error_status(v6, ICMPV6_TIME_EXCEEDED),
+            Some(IcmpEchoStatus::TimedOut)
+        );
+        // Echo reply / request and unrelated types are not errors
+        assert_eq!(IcmpPacket::error_status(v4, 0), None);
+        assert_eq!(IcmpPacket::error_status(v4, 8), None);
+        assert_eq!(IcmpPacket::error_status(v4, 12), None);
+        assert_eq!(IcmpPacket::error_status(v6, 129), None);
+        assert_eq!(IcmpPacket::error_status(v6, 4), None);
+        // Type codes are family specific (v4 type 3 is v6 Time Exceeded)
+        assert_eq!(
+            IcmpPacket::error_status(v6, ICMPV4_DEST_UNREACHABLE),
+            Some(IcmpEchoStatus::TimedOut)
+        );
+        assert_eq!(IcmpPacket::error_status(v4, ICMPV6_DEST_UNREACHABLE), None);
+    }
+
+    #[test]
+    fn test_parse_embedded_echo_request() {
+        let v4: IpAddr = "127.0.0.1".parse().unwrap();
+        let v6: IpAddr = "::1".parse().unwrap();
+        let header_v4 = [8u8, 0, 0xAB, 0xCD, 0x12, 0x34, 0x56, 0x78];
+        assert_eq!(
+            IcmpPacket::parse_embedded_echo_request(&header_v4, v4),
+            Some((0x1234, 0x5678))
+        );
+        // Extra bytes after the header are ignored
+        let mut longer = header_v4.to_vec();
+        longer.extend_from_slice(&[1, 2, 3, 4]);
+        assert_eq!(
+            IcmpPacket::parse_embedded_echo_request(&longer, v4),
+            Some((0x1234, 0x5678))
+        );
+        let header_v6 = [128u8, 0, 0, 0, 0xFF, 0xEE, 0x00, 0x01];
+        assert_eq!(
+            IcmpPacket::parse_embedded_echo_request(&header_v6, v6),
+            Some((0xFFEE, 0x0001))
+        );
+        // Wrong family, wrong type, too short
+        assert_eq!(
+            IcmpPacket::parse_embedded_echo_request(&header_v4, v6),
+            None
+        );
+        assert_eq!(
+            IcmpPacket::parse_embedded_echo_request(&header_v6, v4),
+            None
+        );
+        let reply = [0u8, 0, 0, 0, 0x12, 0x34, 0x56, 0x78];
+        assert_eq!(IcmpPacket::parse_embedded_echo_request(&reply, v4), None);
+        assert_eq!(
+            IcmpPacket::parse_embedded_echo_request(&header_v4[..7], v4),
+            None
+        );
     }
 }

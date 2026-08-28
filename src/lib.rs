@@ -10,6 +10,10 @@
 //! - **macOS/Linux**: Uses ICMP sockets with Tokio for async operations. On Linux, requires
 //!   the `net.ipv4.ping_group_range` sysctl parameter to allow unprivileged ICMP sockets.
 //!
+//! On every platform [`IcmpEchoRequestor::send`] must be polled inside a Tokio runtime with
+//! the time driver enabled (the default for `#[tokio::main]`): the configured timeout is
+//! enforced by Tokio, independently of the operating system's own timers.
+//!
 //! ## Basic Usage
 //!
 //! ```rust,no_run

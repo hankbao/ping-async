@@ -1294,9 +1294,11 @@ mod tests {
         Ok(())
     }
 
+    // `IcmpEchoRequestor::new` registers the socket with the Tokio reactor, so this
+    // needs a runtime even though nothing is awaited.
     #[cfg(target_os = "macos")]
-    #[test]
-    fn recv_buffer_is_enlarged_on_macos() {
+    #[tokio::test]
+    async fn recv_buffer_is_enlarged_on_macos() {
         let pinger =
             IcmpEchoRequestor::new("127.0.0.1".parse().unwrap(), None, None, None).unwrap();
         let size = socket2::SockRef::from(&*pinger.inner.socket)

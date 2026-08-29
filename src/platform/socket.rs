@@ -399,7 +399,9 @@ impl IcmpEchoRequestor {
     ///
     /// On Linux, ICMP Destination Unreachable / Time Exceeded messages are received through
     /// the socket error queue (`IP_RECVERR` / `IPV6_RECVERR`) and reported as
-    /// `Unreachable` / `TimedOut` before the local timeout, like on macOS.
+    /// `Unreachable` / `TimedOut` before the local timeout, like on macOS. The other ICMP
+    /// errors that embed the request (Parameter Problem, ICMPv6 Packet Too Big) resolve it
+    /// as `Unknown`, as on Windows.
     ///
     /// # Examples
     ///
@@ -605,9 +607,10 @@ fn deliver_echo_reply(
     true
 }
 
-/// Delivers an ICMP error (Destination Unreachable, Time Exceeded) that embedded one of our
-/// echo requests to the waiting request, matched by identifier and sequence. ICMP errors
-/// carry only the embedded ICMP header, not the payload, so they match on sequence alone.
+/// Delivers an ICMP error (Destination Unreachable, Time Exceeded, Parameter Problem,
+/// Packet Too Big) that embedded one of our echo requests to the waiting request, matched
+/// by identifier and sequence. ICMP errors carry only the embedded ICMP header, not the
+/// payload, so they match on sequence alone.
 fn deliver_error(
     registry: &SharedRegistry,
     identifier: u16,
@@ -1802,8 +1805,35 @@ mod tests {
                 (info.identifier, info.sequence, info.status),
                 (7, 8, IcmpEchoStatus::TimedOut)
             );
+            // Parameter Problem (v4 type 12) and Packet Too Big / Parameter Problem
+            // (v6 types 2 / 4) resolve the request as Unknown instead of being dropped.
+            let info = parse_extended_error(
+                libc::SO_EE_ORIGIN_ICMP,
+                12,
+                &embedded_echo(false, 9, 10),
+                v4,
+            )
+            .unwrap();
+            assert_eq!(
+                (info.identifier, info.sequence, info.status),
+                (9, 10, IcmpEchoStatus::Unknown)
+            );
+            for ee_type in [2u8, 4u8] {
+                let info = parse_extended_error(
+                    libc::SO_EE_ORIGIN_ICMP6,
+                    ee_type,
+                    &embedded_echo(true, 11, 12),
+                    v6,
+                )
+                .unwrap();
+                assert_eq!(
+                    (info.identifier, info.sequence, info.status),
+                    (11, 12, IcmpEchoStatus::Unknown),
+                    "ee_type {ee_type}"
+                );
+            }
 
-            // Wrong origin, unsupported type, short data, non-echo type byte
+            // Wrong origin, unsupported type (Redirect), short data, non-echo type byte
             assert!(parse_extended_error(
                 libc::SO_EE_ORIGIN_LOCAL,
                 3,
@@ -1820,7 +1850,7 @@ mod tests {
             .is_none());
             assert!(parse_extended_error(
                 libc::SO_EE_ORIGIN_ICMP,
-                12,
+                5,
                 &embedded_echo(false, 1, 2),
                 v4
             )

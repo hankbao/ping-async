@@ -6,7 +6,7 @@ use std::io;
 use std::mem::size_of;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddrV6};
 use std::ptr;
-use std::sync::atomic::{AtomicI64, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -24,8 +24,9 @@ use windows::Win32::NetworkManagement::IpHelper::{
     Icmp6CreateFile, Icmp6ParseReplies, Icmp6SendEcho2, IcmpCloseHandle, IcmpCreateFile,
     IcmpParseReplies, IcmpSendEcho2Ex, ICMPV6_ECHO_REPLY_LH as ICMPV6_ECHO_REPLY,
     IP_DEST_HOST_UNREACHABLE, IP_DEST_NET_UNREACHABLE, IP_DEST_PORT_UNREACHABLE,
-    IP_DEST_PROT_UNREACHABLE, IP_DEST_UNREACHABLE, IP_REQ_TIMED_OUT, IP_SUCCESS, IP_TIME_EXCEEDED,
-    IP_TTL_EXPIRED_REASSEM, IP_TTL_EXPIRED_TRANSIT,
+    IP_DEST_PROT_UNREACHABLE, IP_DEST_SCOPE_MISMATCH, IP_DEST_UNREACHABLE, IP_PENDING,
+    IP_REQ_TIMED_OUT, IP_STATUS_BASE, IP_SUCCESS, IP_TIME_EXCEEDED, IP_TTL_EXPIRED_REASSEM,
+    IP_TTL_EXPIRED_TRANSIT, MAX_IP_STATUS,
 };
 use windows::Win32::Networking::WinSock::{IN6_ADDR, SOCKADDR_IN6};
 use windows::Win32::System::Threading::{
@@ -118,8 +119,19 @@ struct RequestParams {
 ///
 /// Ownership: exactly two strong references exist while the request is being started —
 /// one held by [`start_request`] until it returns, one leaked into the wait callback with
-/// `Arc::into_raw` and reclaimed there with `Arc::from_raw`. The callback is the single
-/// completion path: only it parses the buffer, delivers the reply and unregisters the wait.
+/// `Arc::into_raw` and reclaimed there with `Arc::from_raw`.
+///
+/// Completion: the result is published exactly once, through [`RequestContext::publish`],
+/// which builds and sends it while holding the `sender` mutex. For an outcome known
+/// synchronously — the send API completed the request on the spot or rejected it — the
+/// publisher is `start_request`, before it returns, so the caller's deadline can never
+/// overtake a result that already exists; if the driver signalled the event as well and
+/// the callback got there first, `start_request` blocks on the mutex until the callback
+/// has finished sending, so the guarantee holds either way. For a pending request the
+/// publisher is the wait callback, once the driver signals the event. Only the publisher
+/// parses the reply buffer. The callback always runs (the event is signalled by hand for
+/// synchronous outcomes) and is the single cleanup path: it unregisters the wait and
+/// drops its reference.
 struct RequestContext {
     /// Keeps the ICMP handle open until this context is dropped (never read).
     _icmp: Arc<IcmpHandleOwner>,
@@ -128,16 +140,20 @@ struct RequestContext {
     event: HANDLE,
     /// Wait handle from `RegisterWaitForSingleObject`; published before any I/O starts.
     wait_object: AtomicPtr<c_void>,
-    /// `-1` = none; otherwise the error code of an immediately failed send, folded into
-    /// the callback path by signalling the event by hand.
-    immediate_error: AtomicI64,
     /// Written by the driver while a request is in flight; only ever accessed through raw
     /// pointers, never through a Rust reference.
     buffer: Box<UnsafeCell<ReplyBuffer>>,
     target_addr: IpAddr,
     timeout: Duration,
-    sender: Mutex<Option<oneshot::Sender<IcmpEchoReply>>>,
+    sender: Mutex<Option<ReplySender>>,
 }
+
+/// Completion channel of one request: a reply for any outcome the driver reports as an
+/// echo result (including remote timeouts and unreachable destinations), or an
+/// `io::Error` for a local failure of the send API.
+type ReplySender = oneshot::Sender<io::Result<IcmpEchoReply>>;
+#[cfg(test)]
+type ReplyReceiver = oneshot::Receiver<io::Result<IcmpEchoReply>>;
 
 // SAFETY: the raw handles are only used with thread-safe Win32 functions, and the
 // driver-written buffer is never touched through a reference while a request is in flight
@@ -146,7 +162,7 @@ unsafe impl Send for RequestContext {}
 unsafe impl Sync for RequestContext {}
 
 impl RequestContext {
-    fn new(params: &RequestParams, event: HANDLE, sender: oneshot::Sender<IcmpEchoReply>) -> Self {
+    fn new(params: &RequestParams, event: HANDLE, sender: ReplySender) -> Self {
         #[cfg(test)]
         {
             params.stats.contexts_live.fetch_add(1, Ordering::SeqCst);
@@ -158,7 +174,6 @@ impl RequestContext {
             stats: Arc::clone(&params.stats),
             event,
             wait_object: AtomicPtr::new(ptr::null_mut()),
-            immediate_error: AtomicI64::new(-1),
             buffer: Box::new(UnsafeCell::new(ReplyBuffer([0u8; REPLY_BUFFER_SIZE]))),
             target_addr: params.target_addr,
             timeout: params.timeout,
@@ -175,24 +190,44 @@ impl RequestContext {
         REPLY_BUFFER_SIZE as u32
     }
 
-    /// Builds the reply for a completed request. Called from the wait callback only, after
-    /// the driver (or our own `SetEvent`) signalled the event. Must not panic.
+    /// Publishes the request's result exactly once.
+    ///
+    /// The sender mutex is held from the moment the sender is taken until the result has
+    /// been sent, and `make_result` runs inside that critical section. So the two
+    /// completion paths are fully serialised: whichever takes the lock first builds the
+    /// result (it is the only party that parses the buffer) and has it *in the channel*
+    /// before releasing the lock, and the other one then observes that nothing is left to
+    /// publish. In particular, when `start_request` returns `false` from here the result
+    /// is already in the channel, not merely about to be. Returns whether this call
+    /// published.
+    fn publish(&self, make_result: impl FnOnce() -> io::Result<IcmpEchoReply>) -> bool {
+        let mut slot = self
+            .sender
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match slot.take() {
+            Some(sender) => {
+                // The receiver may already be gone (deadline elapsed or future dropped).
+                let _ = sender.send(make_result());
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Builds the result for a request the driver has completed. Called by the holder of
+    /// the sender only: from `start_request` for a synchronous completion, otherwise from
+    /// the wait callback after the driver signalled the event. Must not panic.
     ///
     /// # Safety
     ///
-    /// The driver must no longer be writing to the buffer (the event has been signalled).
-    unsafe fn completion_reply(&self) -> IcmpEchoReply {
-        let immediate = self.immediate_error.load(Ordering::Acquire);
-        if immediate >= 0 {
-            // The send API failed before any I/O started; nothing in the buffer.
-            let status = failed_request_status(immediate as u32, 0);
-            return IcmpEchoReply::new(self.target_addr, status, Duration::ZERO);
-        }
-
+    /// The driver must no longer be writing to the buffer (the send API returned a reply
+    /// count, or the event has been signalled).
+    unsafe fn completion_result(&self) -> io::Result<IcmpEchoReply> {
         let buf = self.buffer_ptr().cast::<c_void>();
         let len = self.buffer_len();
 
-        match self.target_addr {
+        let reply = match self.target_addr {
             IpAddr::V4(_) => {
                 let parsed = IcmpParseReplies(buf, len);
                 let last_error = GetLastError().0;
@@ -228,7 +263,8 @@ impl RequestContext {
                     self.failed_reply(failed_request_status(header.Status, last_error))
                 }
             }
-        }
+        };
+        Ok(reply)
     }
 
     fn failed_reply(&self, status: IcmpEchoStatus) -> IcmpEchoReply {
@@ -291,7 +327,48 @@ fn driver_timeout_ms(timeout: Duration) -> u32 {
     timeout.as_millis().clamp(1, u32::MAX as u128) as u32
 }
 
-/// Status of a request that did not produce a parsed reply.
+/// Whether `code` is an `IP_STATUS` value (the icmpapi's own status space, in which the
+/// driver reports echo outcomes) rather than a Win32 error code.
+fn is_ip_status(code: u32) -> bool {
+    (IP_STATUS_BASE..=MAX_IP_STATUS).contains(&code) || code == IP_PENDING
+}
+
+/// Result of a request that the send API rejected immediately (no I/O was started), from
+/// the `GetLastError()` value read right after the call.
+///
+/// A rejection that the driver expresses as an echo outcome — a timeout, or an unreachable
+/// destination such as "no route" — is a reply, exactly like the same outcome reported
+/// asynchronously. Anything else is a *local* failure (invalid parameters, insufficient
+/// resources, unsupported networking, a buffer problem) and is an `io::Error`: a Win32
+/// error code is carried as an OS error so its kind and message are preserved; an
+/// `IP_STATUS` code, which has no Win32 message, is named in the message.
+fn immediate_failure_result(
+    code: u32,
+    target_addr: IpAddr,
+    timeout: Duration,
+) -> io::Result<IcmpEchoReply> {
+    match ip_error_to_icmp_status(code) {
+        IcmpEchoStatus::TimedOut => Ok(IcmpEchoReply::new(
+            target_addr,
+            IcmpEchoStatus::TimedOut,
+            timeout,
+        )),
+        IcmpEchoStatus::Unreachable => Ok(IcmpEchoReply::new(
+            target_addr,
+            IcmpEchoStatus::Unreachable,
+            Duration::ZERO,
+        )),
+        _ if code == 0 => Err(io::Error::other(
+            "ICMP echo request was rejected without an error code",
+        )),
+        _ if is_ip_status(code) => Err(io::Error::other(format!(
+            "ICMP echo request was rejected with IP_STATUS {code}"
+        ))),
+        _ => Err(io::Error::from_raw_os_error(code as i32)),
+    }
+}
+
+/// Status of a request that the driver completed without a parsed reply.
 ///
 /// Precedence: the reply header's `Status` if non-zero (the buffer is zero-initialised by
 /// us, so non-zero is meaningful), then `GetLastError()` if non-zero, else `Unknown`. A
@@ -470,11 +547,13 @@ impl IcmpEchoRequestor {
     /// # Errors
     ///
     /// Returns an error if:
-    /// - The underlying Windows API call fails
+    /// - The underlying Windows API call fails locally (for example with invalid
+    ///   parameters or insufficient resources) instead of issuing the request
     /// - Internal communication channels fail unexpectedly
     ///
     /// Note that timeout and unreachable conditions are returned as successful
-    /// `IcmpEchoReply` with appropriate status values, not as errors.
+    /// `IcmpEchoReply` with appropriate status values, not as errors — also when the
+    /// driver reports them immediately (for example "no route" to the destination).
     ///
     /// # Platform Notes
     ///
@@ -516,24 +595,38 @@ impl IcmpEchoRequestor {
 
         self.handle_send(reply_tx)?;
 
-        match tokio::time::timeout(self.inner.timeout, reply_rx).await {
-            Ok(Ok(reply)) => Ok(reply),
-            Ok(Err(_canceled)) => Err(io::Error::other("reply channel closed unexpectedly")),
-            Err(_elapsed) => Ok(IcmpEchoReply::new(
-                self.inner.target_addr,
-                IcmpEchoStatus::TimedOut,
-                self.inner.timeout,
-            )),
-        }
+        await_reply(self.inner.timeout, self.inner.target_addr, reply_rx).await
     }
 
-    fn handle_send(&self, reply_tx: oneshot::Sender<IcmpEchoReply>) -> io::Result<()> {
+    fn handle_send(&self, reply_tx: ReplySender) -> io::Result<()> {
         let inner = Arc::clone(&self.inner);
         start_request(
             &self.inner.request_params(),
             reply_tx,
             move |event, buffer, len| inner.do_send(event, buffer, len),
         )
+    }
+}
+
+/// Waits for the result of a started request under the configured deadline.
+///
+/// A result that is already in the channel wins over an elapsed deadline: `timeout` polls
+/// the receiver before its timer, so an outcome published synchronously by
+/// [`start_request`] is returned even for a zero deadline. Only a request that is still
+/// pending in the driver when the deadline elapses resolves as `TimedOut`.
+async fn await_reply(
+    timeout: Duration,
+    target_addr: IpAddr,
+    reply_rx: oneshot::Receiver<io::Result<IcmpEchoReply>>,
+) -> io::Result<IcmpEchoReply> {
+    match tokio::time::timeout(timeout, reply_rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_canceled)) => Err(io::Error::other("reply channel closed unexpectedly")),
+        Err(_elapsed) => Ok(IcmpEchoReply::new(
+            target_addr,
+            IcmpEchoStatus::TimedOut,
+            timeout,
+        )),
     }
 }
 
@@ -611,11 +704,12 @@ impl RequestorInner {
 /// while the event is still nonsignaled, so the callback cannot observe unpublished state.
 ///
 /// After registration the callback owns its raw `Arc` reference exclusively; this function
-/// never reclaims it. Synchronous completion and immediate failure are folded into the
-/// callback path by signalling the event by hand.
+/// never reclaims it. A synchronous completion or an immediate failure is published to
+/// the caller *before this function returns* (see [`RequestContext`]), and the event is
+/// then signalled by hand so that the callback still runs for cleanup.
 fn start_request(
     params: &RequestParams,
-    reply_tx: oneshot::Sender<IcmpEchoReply>,
+    reply_tx: ReplySender,
     start_io: impl FnOnce(HANDLE, *mut u8, u32) -> SendOutcome,
 ) -> io::Result<()> {
     // Auto-reset, initially nonsignaled event for the completion wait.
@@ -651,24 +745,35 @@ fn start_request(
     // Publish the wait handle before anything can signal the event.
     context.wait_object.store(wait_object.0, Ordering::Release);
 
-    match start_io(event, context.buffer_ptr(), context.buffer_len()) {
-        SendOutcome::Pending => {}
-        SendOutcome::Completed => {
-            // The reply is already in the buffer; drive the normal completion path. If the
-            // driver also signalled the event, the second signal is harmless: the wait fires
-            // once and the event is only closed by the last owner of the context.
-            let _ = unsafe { SetEvent(event) };
-        }
-        SendOutcome::Failed(code) => {
-            context
-                .immediate_error
-                .store(i64::from(code), Ordering::Release);
-            let _ = unsafe { SetEvent(event) };
-        }
+    let outcome = start_io(event, context.buffer_ptr(), context.buffer_len());
+    if outcome == SendOutcome::Pending {
+        return Ok(());
     }
-    // SetEvent cannot fail on a valid event we created and have not closed; if it ever did,
-    // the request resolves through the caller's deadline and the context is leaked — it is
-    // never freed twice, because the callback's reference is not reclaimed here.
+
+    // The outcome is known now: publish it before returning, so that the caller's deadline
+    // (even a zero one) cannot overtake it. `publish` serialises this with the callback:
+    // if the driver signalled the event as well and the callback is already running,
+    // exactly one of the two builds and sends the result, and either way the result is in
+    // the channel by the time `publish` returns here.
+    context.publish(|| match outcome {
+        // SAFETY: the send API returned a reply count, so the driver has finished writing
+        // the reply into the buffer.
+        SendOutcome::Completed => unsafe { context.completion_result() },
+        // The send API rejected the request before any I/O started.
+        SendOutcome::Failed(code) => {
+            immediate_failure_result(code, context.target_addr, context.timeout)
+        }
+        SendOutcome::Pending => unreachable!(),
+    });
+
+    // Signal the event by hand so the callback runs for cleanup (it finds the sender gone
+    // and only unregisters the wait and releases its reference). If the driver signalled
+    // it too, the second signal is harmless: the wait fires once and the event is only
+    // closed by the last owner of the context. SetEvent cannot fail on a valid event we
+    // created and have not closed; if it ever did, the caller still has its result and
+    // only the cleanup is leaked — the context is never freed twice, because the
+    // callback's reference is not reclaimed here.
+    let _ = unsafe { SetEvent(event) };
 
     Ok(())
 }
@@ -683,7 +788,10 @@ fn ip_error_to_icmp_status(code: u32) -> IcmpEchoStatus {
         | IP_DEST_NET_UNREACHABLE
         | IP_DEST_PORT_UNREACHABLE
         | IP_DEST_PROT_UNREACHABLE
-        | IP_DEST_UNREACHABLE => IcmpEchoStatus::Unreachable,
+        | IP_DEST_UNREACHABLE
+        // The IPv6 "no route" / "address unreachable" / "prohibited" codes share the
+        // values of IP_DEST_NET/HOST/PROT_UNREACHABLE above; scope mismatch is distinct.
+        | IP_DEST_SCOPE_MISMATCH => IcmpEchoStatus::Unreachable,
         code if code == ERROR_NETWORK_UNREACHABLE.0
             || code == ERROR_HOST_UNREACHABLE.0
             || code == ERROR_PROTOCOL_UNREACHABLE.0
@@ -695,7 +803,8 @@ fn ip_error_to_icmp_status(code: u32) -> IcmpEchoStatus {
     }
 }
 
-/// Completion callback: the single completion path for a request.
+/// Completion callback: publishes the result of a request that was still pending when
+/// `start_request` returned, and is the single cleanup path for every request.
 ///
 /// Runs on a thread-pool wait thread once the event is signalled. It must not panic (a
 /// panic in an `extern "system"` function aborts the process) and must not block.
@@ -704,17 +813,11 @@ unsafe extern "system" fn wait_callback(ptr: *mut c_void, _timer_fired: bool) {
     // callback runs at most once (WT_EXECUTEONLYONCE), so it is reclaimed exactly once.
     let context = Arc::from_raw(ptr as *const RequestContext);
 
-    let reply = context.completion_reply();
-
-    let sender = context
-        .sender
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .take();
-    if let Some(sender) = sender {
-        // The receiver may already be gone (deadline elapsed or future dropped).
-        let _ = sender.send(reply);
-    }
+    // A no-op if start_request already published a synchronous outcome (the buffer is
+    // then not ours to parse). The lock is only ever held briefly by start_request, so
+    // this does not block the wait thread in any meaningful way.
+    // SAFETY: the event has been signalled, so the driver is done with the buffer.
+    context.publish(|| context.completion_result());
 
     let wait_object = context.wait_object.load(Ordering::Acquire);
     if !wait_object.is_null() {
@@ -824,10 +927,7 @@ mod tests {
     }
 
     /// Starts a request through the production lifecycle with a stub I/O starter.
-    fn start_stub(
-        fx: &Fixture,
-        outcome: SendOutcome,
-    ) -> (oneshot::Receiver<IcmpEchoReply>, CapturedEvent) {
+    fn start_stub(fx: &Fixture, outcome: SendOutcome) -> (ReplyReceiver, CapturedEvent) {
         let (tx, rx) = oneshot::channel();
         let captured = CapturedEvent::default();
         let c = captured.clone();
@@ -891,6 +991,78 @@ mod tests {
     }
 
     #[test]
+    fn ip_error_to_icmp_status_table() {
+        use windows::Win32::NetworkManagement::IpHelper::{
+            IP_BUF_TOO_SMALL, IP_DEST_ADDR_UNREACHABLE, IP_DEST_NO_ROUTE, IP_DEST_PROHIBITED,
+            IP_PARAM_PROBLEM,
+        };
+        assert_eq!(ip_error_to_icmp_status(IP_SUCCESS), IcmpEchoStatus::Success);
+        assert_eq!(
+            ip_error_to_icmp_status(IP_REQ_TIMED_OUT),
+            IcmpEchoStatus::TimedOut
+        );
+        for code in [
+            IP_DEST_HOST_UNREACHABLE,
+            IP_DEST_NO_ROUTE,
+            IP_DEST_ADDR_UNREACHABLE,
+            IP_DEST_PROHIBITED,
+            IP_DEST_SCOPE_MISMATCH,
+            ERROR_HOST_UNREACHABLE.0,
+        ] {
+            assert_eq!(
+                ip_error_to_icmp_status(code),
+                IcmpEchoStatus::Unreachable,
+                "{code}"
+            );
+        }
+        assert_eq!(
+            ip_error_to_icmp_status(IP_PARAM_PROBLEM),
+            IcmpEchoStatus::Unknown
+        );
+        assert_eq!(
+            ip_error_to_icmp_status(IP_BUF_TOO_SMALL),
+            IcmpEchoStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn immediate_failure_result_table() {
+        use windows::Win32::Foundation::{ERROR_INVALID_PARAMETER, ERROR_NOT_ENOUGH_MEMORY};
+        use windows::Win32::NetworkManagement::IpHelper::{IP_BUF_TOO_SMALL, IP_GENERAL_FAILURE};
+
+        let target: IpAddr = "127.0.0.1".parse().unwrap();
+        let timeout = Duration::from_millis(750);
+
+        // Echo outcomes the driver reports immediately are replies.
+        let reply = immediate_failure_result(IP_REQ_TIMED_OUT, target, timeout).unwrap();
+        assert_eq!(reply.status(), IcmpEchoStatus::TimedOut);
+        assert_eq!(reply.round_trip_time(), timeout);
+        assert_eq!(reply.destination(), target);
+        let reply = immediate_failure_result(IP_DEST_HOST_UNREACHABLE, target, timeout).unwrap();
+        assert_eq!(reply.status(), IcmpEchoStatus::Unreachable);
+        assert_eq!(reply.round_trip_time(), Duration::ZERO);
+        let reply = immediate_failure_result(ERROR_HOST_UNREACHABLE.0, target, timeout).unwrap();
+        assert_eq!(reply.status(), IcmpEchoStatus::Unreachable);
+
+        // Local Win32 failures keep their OS error code and kind.
+        let err = immediate_failure_result(ERROR_INVALID_PARAMETER.0, target, timeout).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(ERROR_INVALID_PARAMETER.0 as i32));
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        let err = immediate_failure_result(ERROR_NOT_ENOUGH_MEMORY.0, target, timeout).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(ERROR_NOT_ENOUGH_MEMORY.0 as i32));
+
+        // IP_STATUS codes that are not echo outcomes are local failures too.
+        for code in [IP_BUF_TOO_SMALL, IP_GENERAL_FAILURE, IP_PENDING] {
+            let err = immediate_failure_result(code, target, timeout).unwrap_err();
+            assert_eq!(err.raw_os_error(), None, "{code}");
+            assert!(err.to_string().contains(&code.to_string()), "{err}");
+        }
+        // A rejection without an error code is never a Success reply.
+        let err = immediate_failure_result(0, target, timeout).unwrap_err();
+        assert_eq!(err.raw_os_error(), None);
+    }
+
+    #[test]
     fn driver_timeout_ms_table() {
         assert_eq!(driver_timeout_ms(Duration::ZERO), 1);
         assert_eq!(driver_timeout_ms(Duration::from_micros(500)), 1);
@@ -905,7 +1077,7 @@ mod tests {
     async fn stub_failed_timed_out_maps_and_cleans() {
         let fx = fixture("127.0.0.1", Duration::from_secs(1));
         let (rx, _ev) = start_stub(&fx, SendOutcome::Failed(IP_REQ_TIMED_OUT));
-        let reply = rx.await.unwrap();
+        let reply = rx.await.unwrap().unwrap();
         assert_eq!(reply.status(), IcmpEchoStatus::TimedOut);
         assert!(wait_until_clean(&fx.stats, Duration::from_secs(2)).await);
     }
@@ -914,9 +1086,188 @@ mod tests {
     async fn stub_failed_unreachable_maps_and_cleans() {
         let fx = fixture("127.0.0.1", Duration::from_secs(1));
         let (rx, _ev) = start_stub(&fx, SendOutcome::Failed(IP_DEST_HOST_UNREACHABLE));
-        let reply = rx.await.unwrap();
+        let reply = rx.await.unwrap().unwrap();
         assert_eq!(reply.status(), IcmpEchoStatus::Unreachable);
         assert!(wait_until_clean(&fx.stats, Duration::from_secs(2)).await);
+    }
+
+    /// An immediate local failure of the send API surfaces as an `io::Error` carrying the
+    /// Win32 code — not as an `Unknown` reply — is published before `start_request`
+    /// returns (not by the wait thread), and releases every resource.
+    #[tokio::test]
+    async fn stub_failed_local_error_is_io_error_and_cleans() {
+        use windows::Win32::Foundation::ERROR_INVALID_PARAMETER;
+
+        let fx = fixture("127.0.0.1", Duration::from_secs(1));
+        let (mut rx, _ev) = start_stub(&fx, SendOutcome::Failed(ERROR_INVALID_PARAMETER.0));
+        let result = rx
+            .try_recv()
+            .expect("channel open")
+            .expect("result must already be published when start_request returns");
+        let err = result.expect_err("local failure must be an error");
+        assert_eq!(err.raw_os_error(), Some(ERROR_INVALID_PARAMETER.0 as i32));
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(wait_until_clean(&fx.stats, Duration::from_secs(2)).await);
+    }
+
+    /// The public `send()` propagates that error through its deadline wrapper.
+    #[tokio::test]
+    async fn send_propagates_immediate_local_error() {
+        use windows::Win32::Foundation::ERROR_NOT_SUPPORTED;
+
+        let fx = fixture("127.0.0.1", Duration::from_secs(1));
+        let (reply_tx, reply_rx) = oneshot::channel();
+        start_request(
+            &fx.requestor.inner.request_params(),
+            reply_tx,
+            |_event, _buf, _len| SendOutcome::Failed(ERROR_NOT_SUPPORTED.0),
+        )
+        .unwrap();
+        let err = await_reply(
+            fx.requestor.inner.timeout,
+            fx.requestor.inner.target_addr,
+            reply_rx,
+        )
+        .await
+        .expect_err("local failure must be an error");
+        assert_eq!(err.raw_os_error(), Some(ERROR_NOT_SUPPORTED.0 as i32));
+        assert!(wait_until_clean(&fx.stats, Duration::from_secs(2)).await);
+    }
+
+    /// Mirrors `send()` for a stub-started request: start it, then wait under `deadline`
+    /// exactly like the public method does.
+    async fn send_like(
+        fx: &Fixture,
+        deadline: Duration,
+        outcome: SendOutcome,
+    ) -> io::Result<IcmpEchoReply> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        start_request(
+            &fx.requestor.inner.request_params(),
+            reply_tx,
+            move |_event, _buf, _len| outcome,
+        )
+        .unwrap();
+        await_reply(deadline, fx.requestor.inner.target_addr, reply_rx).await
+    }
+
+    /// Outcomes known when the send API returns must reach the caller even when the
+    /// deadline has already elapsed: a zero (or sub-millisecond) deadline may never turn
+    /// an immediate local failure into `Ok(TimedOut)`, nor an immediate remote outcome or
+    /// a synchronous completion into a deadline timeout.
+    #[tokio::test]
+    async fn immediate_outcomes_beat_an_elapsed_deadline() {
+        use windows::Win32::Foundation::ERROR_INVALID_PARAMETER;
+
+        for deadline in [Duration::ZERO, Duration::from_micros(200)] {
+            let fx = fixture("127.0.0.1", deadline);
+
+            // Immediate local failure: an error, never a timeout reply.
+            let err = send_like(
+                &fx,
+                deadline,
+                SendOutcome::Failed(ERROR_INVALID_PARAMETER.0),
+            )
+            .await
+            .expect_err("local failure must stay an error under a zero deadline");
+            assert_eq!(err.raw_os_error(), Some(ERROR_INVALID_PARAMETER.0 as i32));
+
+            // Immediate remote outcome: the driver's status, not the deadline's.
+            let reply = send_like(&fx, deadline, SendOutcome::Failed(IP_DEST_HOST_UNREACHABLE))
+                .await
+                .unwrap();
+            assert_eq!(reply.status(), IcmpEchoStatus::Unreachable);
+
+            // Synchronous completion: the (stub, zeroed) buffer is parsed and published by
+            // start_request itself, i.e. the result is in the channel before the caller
+            // even starts its deadline — which is what makes `await_reply` return it.
+            let (mut rx, _ev) = start_stub(&fx, SendOutcome::Completed);
+            let published = rx
+                .try_recv()
+                .expect("channel open")
+                .expect("synchronous completion must be published before start_request returns");
+            let reply = published.expect("a completed request is a reply, not an error");
+            assert_ne!(reply.status(), IcmpEchoStatus::Success);
+
+            assert!(wait_until_clean(&fx.stats, Duration::from_secs(2)).await);
+        }
+    }
+
+    /// A synchronous completion for which the driver *also* signals the event, so the wait
+    /// callback contends with `start_request` for publishing. Whichever wins, the result
+    /// must be in the channel when `start_request` returns — never can a zero deadline
+    /// find the channel empty because the callback took the sender but has not sent yet.
+    /// `callback_head_start` makes the callback win deterministically; `None` lets them race.
+    async fn contended_synchronous_completion(callback_head_start: Option<Duration>) {
+        let fx = fixture("127.0.0.1", Duration::ZERO);
+        for i in 0..200 {
+            let (reply_tx, mut reply_rx) = oneshot::channel();
+            start_request(
+                &fx.requestor.inner.request_params(),
+                reply_tx,
+                move |event, _buf, _len| {
+                    // The driver signals the event for a synchronous completion.
+                    unsafe { SetEvent(event).unwrap() };
+                    if let Some(head_start) = callback_head_start {
+                        std::thread::sleep(head_start);
+                    }
+                    SendOutcome::Completed
+                },
+            )
+            .unwrap();
+            let published = reply_rx
+                .try_recv()
+                .expect("channel open")
+                .unwrap_or_else(|| {
+                    panic!("iteration {i}: result not published when start_request returned")
+                });
+            let reply = published.expect("a completed request is a reply, not an error");
+            assert_ne!(reply.status(), IcmpEchoStatus::Success);
+        }
+        assert!(wait_until_clean(&fx.stats, Duration::from_secs(5)).await);
+    }
+
+    #[tokio::test]
+    async fn contended_synchronous_completion_racing_callback() {
+        contended_synchronous_completion(None).await;
+    }
+
+    #[tokio::test]
+    async fn contended_synchronous_completion_callback_first() {
+        contended_synchronous_completion(Some(Duration::from_millis(2))).await;
+    }
+
+    /// The same through the deadline wrapper, as `send()` does it: a zero deadline must
+    /// return the completed request's reply, not the deadline's `TimedOut`. The context
+    /// is given a 1 s timeout while the deadline is zero, so the two are distinguishable
+    /// by value: a published reply that parses as a timeout carries rtt = 1 s, the
+    /// deadline path's `TimedOut` carries rtt = 0.
+    #[tokio::test]
+    async fn contended_synchronous_completion_beats_zero_deadline() {
+        let fx = fixture("127.0.0.1", Duration::from_secs(1));
+        for i in 0..50 {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            start_request(
+                &fx.requestor.inner.request_params(),
+                reply_tx,
+                |event, _buf, _len| {
+                    unsafe { SetEvent(event).unwrap() };
+                    std::thread::sleep(Duration::from_millis(1));
+                    SendOutcome::Completed
+                },
+            )
+            .unwrap();
+            let reply = await_reply(Duration::ZERO, fx.requestor.inner.target_addr, reply_rx)
+                .await
+                .unwrap();
+            assert_ne!(reply.status(), IcmpEchoStatus::Success);
+            assert!(
+                !(reply.status() == IcmpEchoStatus::TimedOut
+                    && reply.round_trip_time() == Duration::ZERO),
+                "iteration {i}: the deadline overtook a synchronous completion: {reply:?}"
+            );
+        }
+        assert!(wait_until_clean(&fx.stats, Duration::from_secs(5)).await);
     }
 
     #[tokio::test]
@@ -925,7 +1276,7 @@ mod tests {
         let (rx, ev) = start_stub(&fx, SendOutcome::Pending);
         assert_eq!(snapshot(&fx.stats), (1, 1, 1));
         ev.signal();
-        let reply = rx.await.unwrap();
+        let reply = rx.await.unwrap().unwrap();
         assert_ne!(reply.status(), IcmpEchoStatus::Success);
         assert!(wait_until_clean(&fx.stats, Duration::from_secs(2)).await);
     }
@@ -982,6 +1333,7 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_secs(1), rx).await;
         let reply = result
             .expect("manual SetEvent must complete the request before the deadline")
+            .unwrap()
             .unwrap();
         assert_ne!(reply.status(), IcmpEchoStatus::Success);
         assert!(wait_until_clean(&fx.stats, Duration::from_secs(2)).await);

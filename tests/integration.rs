@@ -4,7 +4,19 @@ use std::io;
 use std::net::IpAddr;
 use std::time::Duration;
 
-use ping_async::{IcmpEchoRequestor, IcmpEchoStatus};
+use ping_async::{IcmpEchoReply, IcmpEchoRequestor, IcmpEchoStatus};
+
+/// A loopback echo must come back as `Success`. `send()` reports a timeout or any other
+/// remote outcome as `Ok(reply)`, so checking `is_ok()` alone would not notice a backend
+/// that never delivers a reply.
+fn assert_loopback_success(reply: &IcmpEchoReply, what: &str) {
+    assert_eq!(reply.destination(), "127.0.0.1".parse::<IpAddr>().unwrap());
+    assert_eq!(
+        reply.status(),
+        IcmpEchoStatus::Success,
+        "{what}: loopback echo did not succeed: {reply:?}"
+    );
+}
 
 /// Test that multiple IcmpEchoRequestor instances can target the same IP
 #[tokio::test]
@@ -15,14 +27,11 @@ async fn test_multiple_requestors_same_target() {
     // Both should work concurrently without interfering
     let (result1, result2) = tokio::join!(req1.send(), req2.send());
 
-    assert!(result1.is_ok(), "First requestor should succeed");
-    assert!(result2.is_ok(), "Second requestor should succeed");
+    let reply1 = result1.expect("first requestor");
+    let reply2 = result2.expect("second requestor");
 
-    let reply1 = result1.unwrap();
-    let reply2 = result2.unwrap();
-
-    assert_eq!(reply1.destination(), "127.0.0.1".parse::<IpAddr>().unwrap());
-    assert_eq!(reply2.destination(), "127.0.0.1".parse::<IpAddr>().unwrap());
+    assert_loopback_success(&reply1, "first requestor");
+    assert_loopback_success(&reply2, "second requestor");
 }
 
 #[tokio::test]
@@ -33,14 +42,28 @@ async fn test_high_concurrency() {
     let futures: Vec<_> = (0..50).map(|_| req.send()).collect();
     let results = futures::future::join_all(futures).await;
 
-    // All should complete without panics or handle leaks
+    // All should complete without panics, handle leaks or local errors
     assert_eq!(results.len(), 50);
+    let replies: Vec<IcmpEchoReply> = results
+        .into_iter()
+        .enumerate()
+        .map(|(i, r)| r.unwrap_or_else(|e| panic!("request {i} failed locally: {e}")))
+        .collect();
+    for reply in &replies {
+        assert_eq!(reply.destination(), "127.0.0.1".parse::<IpAddr>().unwrap());
+    }
 
-    // Most should succeed (loopback should be reliable)
-    let success_count = results.iter().filter(|r| r.is_ok()).count();
+    // Nearly all must be answered. The small tolerance is only a guard against unrelated
+    // ICMP traffic on the host: on macOS every ICMP datagram socket receives every echo
+    // reply on the machine, so a burst from another process can still overflow a socket's
+    // receive buffer and drop some of this test's replies.
+    let success_count = replies
+        .iter()
+        .filter(|reply| reply.status() == IcmpEchoStatus::Success)
+        .count();
     assert!(
         success_count > 40,
-        "Most loopback pings should succeed, got {success_count}/50"
+        "Most loopback pings should succeed, got {success_count}/50: {replies:?}"
     );
 }
 
@@ -51,8 +74,8 @@ async fn test_rapid_firing() {
 
     // Rapid fire requests to stress callback unregistration
     for i in 0..20 {
-        let result = req.send().await;
-        assert!(result.is_ok(), "Request {i} should succeed");
+        let reply = req.send().await.expect("send must not fail locally");
+        assert_loopback_success(&reply, &format!("request {i}"));
     }
 }
 

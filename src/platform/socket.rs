@@ -163,10 +163,21 @@ struct RouterContext {
     socket: Arc<UdpSocket>,
     registry: SharedRegistry,
     failed: SharedFailure,
-    /// Number of supported ICMP error-queue messages drained by anyone (router or
-    /// `send()`), published under `errqueue_lock`. Always 0 on macOS.
+    /// Number of error-queue messages removed by anyone (router or `send()`) — every
+    /// message, whether or not it is a supported ICMP error — published under
+    /// `errqueue_lock`. A removed message is what explains a one-shot `sk_err` observed
+    /// by a receive or a send. Always 0 on macOS.
     errqueue_drained: Arc<AtomicUsize>,
     errqueue_lock: ErrQueueLock,
+}
+
+/// What one drain of the error queue removed: every message (`removed`, including ones
+/// that are not supported ICMP errors, such as a Redirect queued with `EREMOTEIO`) and
+/// the supported ICMP errors among them, ready to dispatch.
+#[derive(Default)]
+struct Drained {
+    removed: usize,
+    infos: Vec<IcmpErrorInfo>,
 }
 
 /// Why `run_request` could not produce a reply.
@@ -500,32 +511,45 @@ impl IcmpEchoRequestor {
         self.inner.socket.send_to(bytes, target).await.map(|_| ())
     }
 
-    /// The send stage of one request on Linux: `send_to`, retried exactly once after
-    /// draining the error queue.
+    /// The send stage of one request on Linux: `send_to`, retried after every failure that
+    /// a queued ICMP error explains.
     ///
-    /// With `IP_RECVERR` enabled every ICMP error also sets the socket's one-shot `sk_err`,
-    /// and the kernel's send path consumes it (`sock_alloc_send_pskb` returns and clears a
-    /// pending error) *after* the route lookup succeeded. So a `send_to` failure is either a
-    /// genuine local error for this destination — which repeats on retry — or another
-    /// request's swallowed ICMP errno, in which case the queued message still has to be
-    /// dispatched to its own waiter and the retry succeeds.
+    /// With `IP_RECVERR` enabled every ICMP error (including a Redirect or Source Quench,
+    /// queued with `EREMOTEIO`) also sets the socket's one-shot `sk_err`, and the kernel's
+    /// send path consumes it (`sock_alloc_send_pskb` returns and clears a pending error)
+    /// *after* the route lookup succeeded — so the failing `send_to` never transmitted
+    /// anything. Such a failure is another request's swallowed ICMP errno: the queued
+    /// message still has to be dispatched to its own waiter, and this request has to be
+    /// sent again. Because a new error can arrive between one drain and the next attempt,
+    /// this is a loop, not a single retry: after each failure the queue is drained and
+    /// dispatched, and the send is repeated as long as *someone* (this drain or the router,
+    /// via the shared `errqueue_drained` counter) removed a message since before the
+    /// attempt. Only a failure with nothing removed is a genuine local error for this
+    /// destination and is returned. The caller's deadline bounds the loop.
     #[cfg(target_os = "linux")]
     async fn send_stage(&self, bytes: &[u8], target: SocketAddr) -> io::Result<()> {
-        if self.inner.socket.send_to(bytes, target).await.is_ok() {
-            return Ok(());
-        }
         let ctx = &self.inner.router_context;
-        let infos = {
-            let _guard = lock_errqueue(&ctx.errqueue_lock);
-            let infos = errqueue::drain(self.inner.socket.as_raw_fd(), ctx.target_addr);
-            ctx.errqueue_drained
-                .fetch_add(infos.len(), Ordering::SeqCst);
-            infos
-        };
-        for info in &infos {
-            deliver_error(&ctx.registry, self.inner.identifier, ctx.target_addr, info);
+        loop {
+            let removed_before = ctx.errqueue_drained.load(Ordering::SeqCst);
+            let error = match self.inner.socket.send_to(bytes, target).await {
+                Ok(_) => return Ok(()),
+                Err(e) => e,
+            };
+            let drained = {
+                let _guard = lock_errqueue(&ctx.errqueue_lock);
+                let drained = errqueue::drain(self.inner.socket.as_raw_fd(), ctx.target_addr);
+                ctx.errqueue_drained
+                    .fetch_add(drained.removed, Ordering::SeqCst);
+                drained
+            };
+            for info in &drained.infos {
+                deliver_error(&ctx.registry, self.inner.identifier, ctx.target_addr, info);
+            }
+            if ctx.errqueue_drained.load(Ordering::SeqCst) == removed_before {
+                // Nothing was queued: the errno is this destination's own.
+                return Err(error);
+            }
         }
-        self.inner.socket.send_to(bytes, target).await.map(|_| ())
     }
 
     fn ensure_router_running(&self) {
@@ -762,7 +786,7 @@ fn handle_wake(
     state: &mut RouterState,
     wake: io::Result<usize>,
     buf: &[u8],
-    drain: &mut dyn FnMut() -> Vec<IcmpErrorInfo>,
+    drain: &mut dyn FnMut() -> Drained,
 ) -> RouterStep {
     let action = wake_action(&wake);
 
@@ -793,10 +817,8 @@ fn handle_wake(
     // published before we classify. Dispatch happens after the lock is released.
     let (infos, router_action) = {
         let _guard = lock_errqueue(&state.errqueue_lock);
-        let infos = drain();
-        state
-            .errqueue_drained
-            .fetch_add(infos.len(), Ordering::SeqCst);
+        let Drained { removed, infos } = drain();
+        state.errqueue_drained.fetch_add(removed, Ordering::SeqCst);
         let now = state.errqueue_drained.load(Ordering::SeqCst);
         let drained_since_last_wake = now.wrapping_sub(state.last_gen);
         state.last_gen = now;
@@ -874,7 +896,7 @@ async fn reply_router_loop(socket: Arc<UdpSocket>, mut state: RouterState) {
         move || errqueue::drain(fd, target_addr)
     };
     #[cfg(not(target_os = "linux"))]
-    let mut drain = Vec::new;
+    let mut drain = Drained::default;
 
     loop {
         let wake = match socket.ready(Interest::READABLE | Interest::ERROR).await {
@@ -905,6 +927,7 @@ mod errqueue {
 
     use socket2::Socket;
 
+    use super::Drained;
     use crate::icmp::{IcmpErrorInfo, IcmpPacket};
 
     /// Enables delivery of ICMP errors through the socket error queue.
@@ -1014,18 +1037,19 @@ mod errqueue {
         Ok(Some(None))
     }
 
-    /// Removes every queued message and returns the supported ICMP errors among them.
-    /// Never blocks; stops at `EAGAIN` or any other receive error.
-    pub(super) fn drain(fd: RawFd, target_addr: IpAddr) -> Vec<IcmpErrorInfo> {
-        let mut infos = Vec::new();
-        loop {
-            match recv_one(fd, target_addr) {
-                Ok(Some(Some(info))) => infos.push(info),
-                Ok(Some(None)) => continue,
-                Ok(None) | Err(_) => break,
+    /// Removes every queued message and returns how many were removed together with the
+    /// supported ICMP errors among them. Never blocks; stops at `EAGAIN` or any other
+    /// receive error.
+    pub(super) fn drain(fd: RawFd, target_addr: IpAddr) -> Drained {
+        let mut drained = Drained::default();
+        // Stops at `Ok(None)` (queue empty) or any receive error.
+        while let Ok(Some(info)) = recv_one(fd, target_addr) {
+            drained.removed += 1;
+            if let Some(info) = info {
+                drained.infos.push(info);
             }
         }
-        infos
+        drained
     }
 }
 
@@ -1168,8 +1192,8 @@ mod tests {
         (seq, rx)
     }
 
-    fn no_drain() -> Vec<IcmpErrorInfo> {
-        Vec::new()
+    fn no_drain() -> Drained {
+        Drained::default()
     }
 
     fn err(kind: io::ErrorKind) -> io::Result<usize> {
@@ -1811,11 +1835,14 @@ mod tests {
             let calls = std::cell::Cell::new(0);
             let mut drain = || {
                 calls.set(calls.get() + 1);
-                vec![IcmpErrorInfo {
-                    identifier: TEST_IDENTIFIER,
-                    sequence: seq,
-                    status: IcmpEchoStatus::Unreachable,
-                }]
+                Drained {
+                    removed: 1,
+                    infos: vec![IcmpErrorInfo {
+                        identifier: TEST_IDENTIFIER,
+                        sequence: seq,
+                        status: IcmpEchoStatus::Unreachable,
+                    }],
+                }
             };
             let step = handle_wake(&mut state, err(kind), &[], &mut drain);
             assert_eq!(step, RouterStep::Continue, "{kind:?}");
@@ -2024,13 +2051,17 @@ mod tests {
 
         /// One concurrent-send run: `count` requests are started `spacing` apart while ICMP
         /// errors arrive for the earlier ones (the sk_err-swallowed-by-sendmsg scenario).
-        /// Every request must resolve through an ICMP error — never through the local
-        /// timeout, which is what a swallowed `sk_err` without a following drain looks like.
-        /// The two outcomes share the `TimedOut` status for Time Exceeded, so they are told
-        /// apart by elapsed time (`bound` is well below the local timeout).
+        /// Every request must resolve through its own ICMP error with exactly the
+        /// `expected` status — never through the local timeout (a swallowed `sk_err` with
+        /// no following drain), never as a local `Err`, and never with another request's
+        /// status (a swallowed errno attributed to the wrong request: Time Exceeded is
+        /// EHOSTUNREACH, which would surface as `Unreachable`). Time Exceeded and the local
+        /// timeout share the `TimedOut` status, so they are told apart by elapsed time
+        /// (`bound` is well below the local timeout).
         async fn concurrent_scenario(
             target: IpAddr,
             ttl: Option<u8>,
+            expected: IcmpEchoStatus,
             count: usize,
             spacing: Duration,
             bound: Duration,
@@ -2051,15 +2082,17 @@ mod tests {
             }
 
             let (mut icmp_errors, mut late, mut other) = (0usize, 0usize, 0usize);
-            for handle in handles {
+            let mut unexpected = Vec::new();
+            for (i, handle) in handles.into_iter().enumerate() {
                 let (reply, elapsed) = handle.await.unwrap();
-                let reply = reply.expect("send() must not error");
+                let reply = reply.unwrap_or_else(|e| panic!("request {i}: send() errored: {e}"));
                 match reply.status() {
-                    IcmpEchoStatus::TimedOut | IcmpEchoStatus::Unreachable if elapsed < bound => {
-                        icmp_errors += 1
+                    status if status == expected && elapsed < bound => icmp_errors += 1,
+                    IcmpEchoStatus::TimedOut if elapsed >= bound => late += 1,
+                    _ => {
+                        other += 1;
+                        unexpected.push((i, reply, elapsed));
                     }
-                    IcmpEchoStatus::TimedOut => late += 1,
-                    _ => other += 1,
                 }
             }
             let drained = pinger
@@ -2071,7 +2104,10 @@ mod tests {
                 "{target} ttl={ttl:?}: icmp_errors={icmp_errors} late={late} other={other}                  drained={drained} in {:?}",
                 started.elapsed()
             );
-            assert_eq!(other, 0);
+            assert_eq!(
+                other, 0,
+                "requests with a status other than {expected:?}: {unexpected:?}"
+            );
             assert_eq!(
                 late, 0,
                 "a request hit the local timeout: swallowed error not dispatched?"
@@ -2097,6 +2133,7 @@ mod tests {
                 concurrent_scenario(
                     target,
                     Some(1),
+                    IcmpEchoStatus::TimedOut,
                     200,
                     Duration::from_millis(20),
                     Duration::from_secs(2),
@@ -2108,6 +2145,7 @@ mod tests {
                 concurrent_scenario(
                     target,
                     None,
+                    IcmpEchoStatus::Unreachable,
                     40,
                     Duration::from_millis(100),
                     Duration::from_secs(6),

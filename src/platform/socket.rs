@@ -436,11 +436,6 @@ impl IcmpEchoRequestor {
     /// }
     /// ```
     pub async fn send(&self) -> io::Result<IcmpEchoReply> {
-        // Check if router failed already — error is persistent, not consumed
-        if let Some(ref router_error) = *lock_failure(&self.inner.router_context.failed) {
-            return Err(router_error.to_io_error());
-        }
-
         // lazy spawning
         self.ensure_router_running();
 
@@ -456,10 +451,12 @@ impl IcmpEchoRequestor {
         let payload = timestamp.to_be_bytes();
 
         // Register in the registry BEFORE sending so fast replies (e.g. loopback)
-        // are not dropped by the router due to a missing entry. The guard removes the
-        // entry on every exit path, including the future being dropped.
+        // are not dropped by the router due to a missing entry. Registration fails fast
+        // with the persisted error if the router has already failed (the check and the
+        // allocation are one critical section, see `register_request`). The guard removes
+        // the entry on every exit path, including the future being dropped.
         let (tx, reply_rx) = oneshot::channel();
-        let (sequence, request_id) = lock_registry(&self.inner.registry).allocate(timestamp, tx)?;
+        let (sequence, request_id) = self.inner.register_request(timestamp, tx)?;
         let _guard = RegistryGuard {
             registry: Arc::clone(&self.inner.registry),
             sequence,
@@ -552,6 +549,28 @@ impl IcmpEchoRequestor {
     }
 }
 
+impl RequestorInner {
+    /// Registers a request, or fails fast with the persisted router error.
+    ///
+    /// The failure check and the allocation happen under the registry lock, and
+    /// [`fail_router`] publishes the failure and clears the registry under that same lock
+    /// (lock order: registry, then failure). So a request either observes the failure, or
+    /// is registered before the failure is published and is then cancelled by the clear —
+    /// it can never be registered after the router has cleared the registry and exited,
+    /// which would leave it waiting for a reply nobody can deliver.
+    fn register_request(
+        &self,
+        sent_timestamp: u64,
+        tx: oneshot::Sender<IcmpEchoReply>,
+    ) -> io::Result<(u16, u64)> {
+        let mut registry = lock_registry(&self.registry);
+        if let Some(ref router_error) = *lock_failure(&self.router_context.failed) {
+            return Err(router_error.to_io_error());
+        }
+        registry.allocate(sent_timestamp, tx)
+    }
+}
+
 impl Drop for RequestorInner {
     fn drop(&mut self) {
         if let Some(abort_handle) = self.router_abort.get() {
@@ -633,13 +652,19 @@ fn deliver_error(
 }
 
 /// Persists a fatal router error and cancels every in-flight request.
+///
+/// Both happen under the registry lock (lock order: registry, then failure — the same
+/// order as `RequestorInner::register_request`), so no request can be registered between
+/// the failure being published and the registry being cleared.
 fn fail_router(registry: &SharedRegistry, failed: &SharedFailure, error: &io::Error) {
+    let mut registry = lock_registry(registry);
+
     // Store the error persistently so all future send() calls fail fast
     *lock_failure(failed) = Some(RouterError::from_io_error(error));
 
     // Drain the registry — dropping senders closes channels, which causes in-flight
     // send() calls to see a closed channel and check `failed` for a consistent error.
-    lock_registry(registry).entries.clear();
+    registry.entries.clear();
 }
 
 /// Per-router state; the shared `Arc`s are the same instances as the requestor's.
@@ -1523,6 +1548,77 @@ mod tests {
 
         let err = fatal_router_error_scenario(false).await;
         assert_eq!(err.to_string(), "reply channel closed");
+    }
+
+    #[tokio::test]
+    async fn send_after_fatal_failure_fails_fast_without_registering() {
+        let pinger = IcmpEchoRequestor::new(
+            "127.0.0.1".parse().unwrap(),
+            None,
+            None,
+            Some(Duration::from_secs(2)),
+        )
+        .unwrap();
+        disable_router(&pinger);
+        fail_router(
+            &pinger.inner.registry,
+            &pinger.inner.router_context.failed,
+            &io::Error::new(io::ErrorKind::PermissionDenied, "boom"),
+        );
+
+        let started = Instant::now();
+        let err = pinger.send().await.expect_err("must fail fast");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(err.to_string(), "boom");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "must not wait for the deadline"
+        );
+        assert_eq!(registry_len(&pinger), 0);
+    }
+
+    /// Registration racing with fatal shutdown: both contend for the registry lock, and
+    /// whichever wins, no request may remain registered once `fail_router` has returned —
+    /// the loser either observes the failure or is cancelled by the clear.
+    #[tokio::test]
+    async fn registration_never_survives_fatal_shutdown() {
+        for _ in 0..50 {
+            let pinger =
+                IcmpEchoRequestor::new("127.0.0.1".parse().unwrap(), None, None, None).unwrap();
+
+            // Hold the registry lock so both sides queue on it, then release.
+            let gate = lock_registry(&pinger.inner.registry);
+            let failer = {
+                let p = pinger.clone();
+                std::thread::spawn(move || {
+                    fail_router(
+                        &p.inner.registry,
+                        &p.inner.router_context.failed,
+                        &io::Error::new(io::ErrorKind::PermissionDenied, "boom"),
+                    )
+                })
+            };
+            let registrar = {
+                let p = pinger.clone();
+                std::thread::spawn(move || {
+                    let (tx, rx) = oneshot::channel();
+                    (p.inner.register_request(1, tx), rx)
+                })
+            };
+            std::thread::sleep(Duration::from_millis(1));
+            drop(gate);
+
+            failer.join().unwrap();
+            let (result, mut rx) = registrar.join().unwrap();
+            match result {
+                Err(e) => assert_eq!(e.kind(), io::ErrorKind::PermissionDenied),
+                Ok(_) => assert!(
+                    matches!(rx.try_recv(), Err(oneshot::Canceled)),
+                    "registered before the failure: must have been cancelled by the clear"
+                ),
+            }
+            assert_eq!(registry_len(&pinger), 0);
+        }
     }
 
     // ---- router wake handling --------------------------------------------------------

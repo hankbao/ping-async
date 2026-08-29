@@ -51,6 +51,9 @@ pub const PING_DEFAULT_TTL: u8 = 128;
 
 /// Default timeout duration for ICMP echo requests.
 /// Requests that don't receive a reply within this time will be marked as timed out.
+///
+/// One second since 1.0.0 (the 0.1.x releases defaulted to two seconds). Pass an explicit
+/// `timeout` to [`IcmpEchoRequestor::new`] to use a different deadline.
 pub const PING_DEFAULT_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Default length of the data payload in ICMP echo request packets.
@@ -147,6 +150,15 @@ impl IcmpEchoReply {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The public defaults are part of the 1.0 contract (published in 1.0.0–1.0.2); a
+    /// change here is a behavioural change for every caller passing `None`.
+    #[test]
+    fn public_defaults_are_stable() {
+        assert_eq!(PING_DEFAULT_TIMEOUT, Duration::from_secs(1));
+        assert_eq!(PING_DEFAULT_TTL, 128);
+        assert_eq!(PING_DEFAULT_REQUEST_DATA_LENGTH, 32);
+    }
 
     #[tokio::test]
     async fn ping_localhost_v4() -> std::io::Result<()> {

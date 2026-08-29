@@ -160,12 +160,23 @@ mod tests {
         assert_eq!(PING_DEFAULT_REQUEST_DATA_LENGTH, 32);
     }
 
+    /// A loopback echo must come back as `Success`: a timeout or any other status here
+    /// means replies are not being delivered, which `send()` reports as `Ok`, not `Err`.
+    fn assert_loopback_success(reply: &IcmpEchoReply, expected: &str) {
+        assert_eq!(reply.destination(), expected.parse::<IpAddr>().unwrap());
+        assert_eq!(
+            reply.status(),
+            IcmpEchoStatus::Success,
+            "loopback echo to {expected} did not succeed: {reply:?}"
+        );
+    }
+
     #[tokio::test]
     async fn ping_localhost_v4() -> std::io::Result<()> {
         let pinger = IcmpEchoRequestor::new("127.0.0.1".parse().unwrap(), None, None, None)?;
         let reply = pinger.send().await?;
 
-        assert_eq!(reply.destination(), "127.0.0.1".parse::<IpAddr>().unwrap());
+        assert_loopback_success(&reply, "127.0.0.1");
         println!("IPv4 ping result: {reply:?}");
 
         Ok(())
@@ -176,7 +187,7 @@ mod tests {
         let pinger = IcmpEchoRequestor::new("::1".parse().unwrap(), None, None, None)?;
         let reply = pinger.send().await?;
 
-        assert_eq!(reply.destination(), "::1".parse::<IpAddr>().unwrap());
+        assert_loopback_success(&reply, "::1");
         println!("IPv6 ping result: {reply:?}");
 
         Ok(())
@@ -191,7 +202,7 @@ mod tests {
         let handle = tokio::spawn(async move { pinger_clone.send().await });
 
         let reply = handle.await.unwrap()?;
-        assert_eq!(reply.destination(), "127.0.0.1".parse::<IpAddr>().unwrap());
+        assert_loopback_success(&reply, "127.0.0.1");
 
         Ok(())
     }
@@ -225,7 +236,7 @@ mod tests {
         // Wait for all pings to complete
         for handle in handles {
             let reply = handle.await.unwrap()?;
-            assert_eq!(reply.destination(), "127.0.0.1".parse::<IpAddr>().unwrap());
+            assert_loopback_success(&reply, "127.0.0.1");
         }
 
         Ok(())
@@ -241,8 +252,8 @@ mod tests {
         let reply1 = pinger1.send().await?;
         let reply2 = pinger2.send().await?;
 
-        assert_eq!(reply1.destination(), "127.0.0.1".parse::<IpAddr>().unwrap());
-        assert_eq!(reply2.destination(), "::1".parse::<IpAddr>().unwrap());
+        assert_loopback_success(&reply1, "127.0.0.1");
+        assert_loopback_success(&reply2, "::1");
 
         Ok(())
     }

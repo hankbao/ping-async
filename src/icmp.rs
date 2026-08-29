@@ -10,8 +10,11 @@ use crate::IcmpEchoStatus;
 // ICMP error message type codes
 const ICMPV4_DEST_UNREACHABLE: u8 = 3;
 const ICMPV4_TIME_EXCEEDED: u8 = 11;
+const ICMPV4_PARAMETER_PROBLEM: u8 = 12;
 const ICMPV6_DEST_UNREACHABLE: u8 = 1;
+const ICMPV6_PACKET_TOO_BIG: u8 = 2;
 const ICMPV6_TIME_EXCEEDED: u8 = 3;
+const ICMPV6_PARAMETER_PROBLEM: u8 = 4;
 
 // ICMP echo request type codes (for verifying embedded packets)
 const ICMPV4_ECHO_REQUEST: u8 = 8;
@@ -422,18 +425,24 @@ impl IcmpPacket {
 
     /// Maps the type of an ICMP *error* message to the status it means for the echo
     /// request it embeds: Destination Unreachable -> `Unreachable`, Time Exceeded ->
-    /// `TimedOut`; any other type is not an error we report (`None`).
+    /// `TimedOut`, and the remaining error types that embed the original request
+    /// (IPv4 Parameter Problem; ICMPv6 Packet Too Big and Parameter Problem) -> `Unknown`,
+    /// matching what the Windows driver reports for the same conditions. Any other type
+    /// (echo traffic, informational messages, Redirect, the deprecated Source Quench) is
+    /// not a failure of the request (`None`).
     pub fn error_status(target_addr: IpAddr, icmp_type: u8) -> Option<IcmpEchoStatus> {
         if target_addr.is_ipv4() {
             match icmp_type {
                 ICMPV4_DEST_UNREACHABLE => Some(IcmpEchoStatus::Unreachable),
                 ICMPV4_TIME_EXCEEDED => Some(IcmpEchoStatus::TimedOut),
+                ICMPV4_PARAMETER_PROBLEM => Some(IcmpEchoStatus::Unknown),
                 _ => None,
             }
         } else {
             match icmp_type {
                 ICMPV6_DEST_UNREACHABLE => Some(IcmpEchoStatus::Unreachable),
                 ICMPV6_TIME_EXCEEDED => Some(IcmpEchoStatus::TimedOut),
+                ICMPV6_PACKET_TOO_BIG | ICMPV6_PARAMETER_PROBLEM => Some(IcmpEchoStatus::Unknown),
                 _ => None,
             }
         }
@@ -1022,18 +1031,94 @@ mod tests {
             IcmpPacket::error_status(v6, ICMPV6_TIME_EXCEEDED),
             Some(IcmpEchoStatus::TimedOut)
         );
-        // Echo reply / request and unrelated types are not errors
+        // Other error types that embed the original request are reported as Unknown
+        assert_eq!(
+            IcmpPacket::error_status(v4, ICMPV4_PARAMETER_PROBLEM),
+            Some(IcmpEchoStatus::Unknown)
+        );
+        assert_eq!(
+            IcmpPacket::error_status(v6, ICMPV6_PACKET_TOO_BIG),
+            Some(IcmpEchoStatus::Unknown)
+        );
+        assert_eq!(
+            IcmpPacket::error_status(v6, ICMPV6_PARAMETER_PROBLEM),
+            Some(IcmpEchoStatus::Unknown)
+        );
+        // Echo reply / request, Redirect, Source Quench and unrelated types are not errors
         assert_eq!(IcmpPacket::error_status(v4, 0), None);
+        assert_eq!(IcmpPacket::error_status(v4, 4), None);
+        assert_eq!(IcmpPacket::error_status(v4, 5), None);
         assert_eq!(IcmpPacket::error_status(v4, 8), None);
-        assert_eq!(IcmpPacket::error_status(v4, 12), None);
+        assert_eq!(IcmpPacket::error_status(v4, 13), None);
+        assert_eq!(IcmpPacket::error_status(v6, 128), None);
         assert_eq!(IcmpPacket::error_status(v6, 129), None);
-        assert_eq!(IcmpPacket::error_status(v6, 4), None);
-        // Type codes are family specific (v4 type 3 is v6 Time Exceeded)
+        assert_eq!(IcmpPacket::error_status(v6, 137), None);
+        // Type codes are family specific (v4 type 3 is v6 Time Exceeded; v4 type 4 is
+        // Source Quench, v6 type 4 is Parameter Problem)
         assert_eq!(
             IcmpPacket::error_status(v6, ICMPV4_DEST_UNREACHABLE),
             Some(IcmpEchoStatus::TimedOut)
         );
         assert_eq!(IcmpPacket::error_status(v4, ICMPV6_DEST_UNREACHABLE), None);
+        assert_eq!(IcmpPacket::error_status(v4, ICMPV6_PARAMETER_PROBLEM), None);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_parse_error_reply_v4_parameter_problem_linux() {
+        let target = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+
+        let mut packet = Vec::new();
+        // ICMP error header: type=12 (Parameter Problem), code=0, pointer=20
+        packet.extend_from_slice(&[ICMPV4_PARAMETER_PROBLEM, 0, 0, 0, 20, 0, 0, 0]);
+        packet.extend_from_slice(&make_ipv4_header(IP_PROTO_ICMP));
+        packet.extend_from_slice(&make_echo_request_v4(0x1234, 0x0009));
+
+        let info = IcmpPacket::parse_error_reply(&packet, target).unwrap();
+        assert_eq!(info.identifier, 0x1234);
+        assert_eq!(info.sequence, 0x0009);
+        assert_eq!(info.status, IcmpEchoStatus::Unknown);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_parse_error_reply_v4_parameter_problem_macos() {
+        let target = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&make_ipv4_header(IP_PROTO_ICMP)); // outer IP header
+        packet.extend_from_slice(&[ICMPV4_PARAMETER_PROBLEM, 0, 0, 0, 20, 0, 0, 0]);
+        packet.extend_from_slice(&make_ipv4_header(IP_PROTO_ICMP));
+        packet.extend_from_slice(&make_echo_request_v4(0x1234, 0x0009));
+
+        let info = IcmpPacket::parse_error_reply(&packet, target).unwrap();
+        assert_eq!(info.identifier, 0x1234);
+        assert_eq!(info.sequence, 0x0009);
+        assert_eq!(info.status, IcmpEchoStatus::Unknown);
+    }
+
+    #[test]
+    fn test_parse_error_reply_v6_packet_too_big_and_parameter_problem() {
+        let target: IpAddr = "2001:db8::1".parse().unwrap();
+
+        for (icmp_type, sequence) in [
+            (ICMPV6_PACKET_TOO_BIG, 0x0011u16),
+            (ICMPV6_PARAMETER_PROBLEM, 0x0012u16),
+        ] {
+            let mut packet = Vec::new();
+            // ICMPv6 error header: 4 bytes MTU (Packet Too Big) / pointer (Parameter Problem)
+            packet.extend_from_slice(&[icmp_type, 0, 0, 0, 0, 0, 0x05, 0x00]);
+            let mut ipv6_hdr = vec![0u8; 40];
+            ipv6_hdr[0] = 0x60;
+            ipv6_hdr[6] = IP_PROTO_ICMPV6;
+            packet.extend_from_slice(&ipv6_hdr);
+            packet.extend_from_slice(&make_echo_request_v6(0x4242, sequence));
+
+            let info = IcmpPacket::parse_error_reply(&packet, target).unwrap();
+            assert_eq!(info.identifier, 0x4242, "type {icmp_type}");
+            assert_eq!(info.sequence, sequence, "type {icmp_type}");
+            assert_eq!(info.status, IcmpEchoStatus::Unknown, "type {icmp_type}");
+        }
     }
 
     #[test]

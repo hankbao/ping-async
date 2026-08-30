@@ -52,9 +52,10 @@ pub const PING_DEFAULT_TTL: u8 = 128;
 /// Default timeout duration for ICMP echo requests.
 /// Requests that don't receive a reply within this time will be marked as timed out.
 ///
-/// One second since 1.0.0 (the 0.1.x releases defaulted to two seconds). Pass an explicit
-/// `timeout` to [`IcmpEchoRequestor::new`] to use a different deadline.
-pub const PING_DEFAULT_TIMEOUT: Duration = Duration::from_secs(1);
+/// Two seconds, as in the 0.1.x releases. Releases 1.0.0 through 1.0.2 shipped with one
+/// second by mistake; callers that relied on that value should pass an explicit `timeout`
+/// to [`IcmpEchoRequestor::new`].
+pub const PING_DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Default length of the data payload in ICMP echo request packets.
 /// This matches the default payload size used by most ping implementations.
@@ -151,11 +152,12 @@ impl IcmpEchoReply {
 mod tests {
     use super::*;
 
-    /// The public defaults are part of the 1.0 contract (published in 1.0.0–1.0.2); a
-    /// change here is a behavioural change for every caller passing `None`.
+    /// The public defaults are part of the crate's contract: a change here is a
+    /// behavioural change for every caller passing `None`, so it must be deliberate (the
+    /// timeout silently became one second in 1.0.0–1.0.2 and had to be restored).
     #[test]
     fn public_defaults_are_stable() {
-        assert_eq!(PING_DEFAULT_TIMEOUT, Duration::from_secs(1));
+        assert_eq!(PING_DEFAULT_TIMEOUT, Duration::from_secs(2));
         assert_eq!(PING_DEFAULT_TTL, 128);
         assert_eq!(PING_DEFAULT_REQUEST_DATA_LENGTH, 32);
     }

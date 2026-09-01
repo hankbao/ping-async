@@ -1,0 +1,27 @@
+#!/bin/bash
+
+# Pre-push hook to run tests
+
+set -e
+
+# Raise the FD soft limit on macOS as a safety margin: every ICMP socket and
+# Tokio runtime in the test suite costs file descriptors and the default soft
+# limit is only 256. The bump stays behind the Darwin guard because Git Bash
+# on Windows cannot raise the limit (hard limit 3200), which under `set -e`
+# would abort the hook before the tests run.
+if [ "$(uname -s)" = "Darwin" ]; then
+    ulimit -n 4096
+fi
+
+echo "Running pre-push checks..."
+
+# Run tests
+echo "Running tests..."
+if ! cargo test --verbose; then
+    echo "Tests failed!"
+    echo "Fix the failing tests before pushing."
+    exit 1
+fi
+echo "Tests passed!"
+
+echo "All pre-push checks passed!"

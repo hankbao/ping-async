@@ -60,6 +60,10 @@ Ping 3: reply from 1.1.1.1, status = Success, time = 19ms
 
 ## Development
 
-CI runs `cargo fmt --check`, `cargo clippy -D warnings`, a build and the test suite on Ubuntu, macOS and Windows on stable Rust, plus a `cargo audit` pass.
+CI runs `cargo fmt --check`, `cargo clippy -D warnings`, a build and the test suite on Ubuntu, macOS and Windows on stable Rust, plus a `cargo audit` pass. The same checks are available locally as git hooks:
+
+```bash
+git config core.hooksPath githooks   # pre-commit: fmt + clippy; pre-push: cargo test
+```
 
 The tests send real ICMP echo requests to the loopback address, so they need the same permissions as the library (see above for Linux). See [`CLAUDE.md`](CLAUDE.md) for the platform-specific behaviour notes and the full set of verification commands.

@@ -43,7 +43,7 @@ mod platform;
 pub use platform::IcmpEchoRequestor;
 
 use std::net::IpAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Default Time-To-Live (TTL) value for ICMP packets.
 /// This matches the default TTL used by most ping implementations.
@@ -103,17 +103,28 @@ impl IcmpEchoStatus {
 
 /// Reply received from an ICMP echo request.
 ///
-/// Contains the destination IP address, status of the ping operation,
-/// and the measured round-trip time.
+/// Contains the destination IP address, the status of the ping operation,
+/// the measured round-trip time, and the monotonic instant at which the
+/// outcome was determined (see [`completed_at`](Self::completed_at)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IcmpEchoReply {
     destination: IpAddr,
     status: IcmpEchoStatus,
     round_trip_time: Duration,
+    completed_at: Instant,
 }
 
 impl IcmpEchoReply {
-    /// Creates a new ICMP echo reply.
+    /// Creates a new ICMP echo reply, recording the current instant as its
+    /// completion time.
+    ///
+    /// The reply's [`completed_at`](Self::completed_at) is stamped with
+    /// [`Instant::now()`] when this constructor runs. Because `PartialEq`
+    /// includes that instant, two replies built by `new` from identical
+    /// arguments generally compare unequal (though a coarse clock may return
+    /// the same instant twice). Use
+    /// [`with_completed_at`](Self::with_completed_at) when a deterministic
+    /// completion instant is needed, for example in tests.
     ///
     /// # Arguments
     ///
@@ -121,10 +132,33 @@ impl IcmpEchoReply {
     /// * `status` - The status of the ping operation
     /// * `round_trip_time` - The measured round-trip time
     pub fn new(destination: IpAddr, status: IcmpEchoStatus, round_trip_time: Duration) -> Self {
+        Self::with_completed_at(destination, status, round_trip_time, Instant::now())
+    }
+
+    /// Creates a new ICMP echo reply with an explicit completion instant.
+    ///
+    /// All four values are stored verbatim. The crate makes no claim about a
+    /// caller-supplied `completed_at`; the guarantees documented on
+    /// [`completed_at`](Self::completed_at) apply to replies returned by
+    /// [`IcmpEchoRequestor::send`].
+    ///
+    /// # Arguments
+    ///
+    /// * `destination` - The IP address that was pinged
+    /// * `status` - The status of the ping operation
+    /// * `round_trip_time` - The measured round-trip time
+    /// * `completed_at` - The instant at which the outcome was determined
+    pub fn with_completed_at(
+        destination: IpAddr,
+        status: IcmpEchoStatus,
+        round_trip_time: Duration,
+        completed_at: Instant,
+    ) -> Self {
         Self {
             destination,
             status,
             round_trip_time,
+            completed_at,
         }
     }
 
@@ -142,15 +176,104 @@ impl IcmpEchoReply {
     ///
     /// For successful pings, this represents the time between sending the echo request
     /// and receiving the echo reply. For failed pings, this may be zero or represent
-    /// the time until the failure was detected.
+    /// the time until the failure was detected; use
+    /// [`completed_at`](Self::completed_at) to place such a reply in time.
     pub fn round_trip_time(&self) -> Duration {
         self.round_trip_time
+    }
+
+    /// Returns the instant at which the outcome of the request was determined.
+    ///
+    /// The value is a monotonic [`std::time::Instant`], stamped with
+    /// [`Instant::now()`] at the site that decides the outcome; it is never
+    /// derived from the round-trip time or from the configured timeout. For a
+    /// reply returned by [`IcmpEchoRequestor::send`]:
+    ///
+    /// - [`Success`](IcmpEchoStatus::Success): when the echo reply was received and
+    ///   matched to the request.
+    /// - [`Unreachable`](IcmpEchoStatus::Unreachable) / [`Unknown`](IcmpEchoStatus::Unknown),
+    ///   and a [`TimedOut`](IcmpEchoStatus::TimedOut) mapped from an ICMP Time Exceeded
+    ///   message or from a driver-reported timeout on Windows: when the ICMP error or the
+    ///   driver's result was received and matched, or when a local send failure was
+    ///   classified as that status.
+    /// - [`TimedOut`](IcmpEchoStatus::TimedOut) from the request deadline: when the
+    ///   library observed that the deadline had passed, which is never before the
+    ///   `send()` call plus the timeout. On Windows the driver applies its own timeout as
+    ///   well and may report it marginally before the nominal deadline; such a reply is
+    ///   stamped when the driver's result was decoded.
+    ///
+    /// In every case the instant is taken once the reply's status is established and
+    /// before the round-trip time is computed or the reply is delivered. It is never
+    /// earlier than the `send()` call that produced the reply and never later than the
+    /// caller observing the resolved future. Unlike
+    /// [`round_trip_time`](Self::round_trip_time), which is zero for ICMP errors, it is
+    /// meaningful for every status, so a caller can place a late-observed error on its
+    /// own timeline:
+    ///
+    /// ```rust,no_run
+    /// use ping_async::IcmpEchoRequestor;
+    /// use std::time::Instant;
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() -> std::io::Result<()> {
+    /// let pinger = IcmpEchoRequestor::new("8.8.8.8".parse().unwrap(), None, None, None)?;
+    /// let issued = Instant::now();
+    /// let reply = pinger.send().await?;
+    /// let offset = reply.completed_at().duration_since(issued);
+    /// println!("{:?} decided {:?} after the request was issued", reply.status(), offset);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// For a reply built with [`new`](Self::new) this is the instant of construction;
+    /// for one built with [`with_completed_at`](Self::with_completed_at) it is whatever
+    /// the caller supplied.
+    pub fn completed_at(&self) -> Instant {
+        self.completed_at
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Asserts that the reply's completion instant lies between `before` (taken before
+    /// the `send()` that produced it) and now.
+    fn assert_completed_between(reply: &IcmpEchoReply, before: Instant) {
+        let now = Instant::now();
+        assert!(
+            before <= reply.completed_at() && reply.completed_at() <= now,
+            "completed_at {:?} must lie within [{before:?}, {now:?}]",
+            reply.completed_at()
+        );
+    }
+
+    #[test]
+    fn with_completed_at_stores_instant_and_stays_copy() {
+        let completed_at = Instant::now();
+        let reply = IcmpEchoReply::with_completed_at(
+            "127.0.0.1".parse().unwrap(),
+            IcmpEchoStatus::Unreachable,
+            Duration::ZERO,
+            completed_at,
+        );
+        assert_eq!(reply.completed_at(), completed_at);
+        // The reply stays `Copy` and comparable with the added field.
+        let copy = reply;
+        assert_eq!(copy, reply);
+    }
+
+    #[test]
+    fn new_stamps_construction_instant() {
+        let before = Instant::now();
+        let reply = IcmpEchoReply::new(
+            "127.0.0.1".parse().unwrap(),
+            IcmpEchoStatus::TimedOut,
+            Duration::ZERO,
+        );
+        let after = Instant::now();
+        assert!(before <= reply.completed_at() && reply.completed_at() <= after);
+    }
 
     /// The public defaults are part of the crate's contract: a change here is a
     /// behavioural change for every caller passing `None`, so it must be deliberate (the
@@ -176,9 +299,11 @@ mod tests {
     #[tokio::test]
     async fn ping_localhost_v4() -> std::io::Result<()> {
         let pinger = IcmpEchoRequestor::new("127.0.0.1".parse().unwrap(), None, None, None)?;
+        let before = Instant::now();
         let reply = pinger.send().await?;
 
         assert_loopback_success(&reply, "127.0.0.1");
+        assert_completed_between(&reply, before);
         println!("IPv4 ping result: {reply:?}");
 
         Ok(())
@@ -187,9 +312,11 @@ mod tests {
     #[tokio::test]
     async fn ping_localhost_v6() -> std::io::Result<()> {
         let pinger = IcmpEchoRequestor::new("::1".parse().unwrap(), None, None, None)?;
+        let before = Instant::now();
         let reply = pinger.send().await?;
 
         assert_loopback_success(&reply, "::1");
+        assert_completed_between(&reply, before);
         println!("IPv6 ping result: {reply:?}");
 
         Ok(())
@@ -201,10 +328,12 @@ mod tests {
 
         // Test that we can clone and use across threads
         let pinger_clone = pinger.clone();
+        let before = Instant::now();
         let handle = tokio::spawn(async move { pinger_clone.send().await });
 
         let reply = handle.await.unwrap()?;
         assert_loopback_success(&reply, "127.0.0.1");
+        assert_completed_between(&reply, before);
 
         Ok(())
     }
@@ -228,6 +357,7 @@ mod tests {
         let pinger = IcmpEchoRequestor::new("127.0.0.1".parse().unwrap(), None, None, None)?;
 
         // Spawn multiple concurrent ping tasks
+        let before = Instant::now();
         let mut handles = Vec::new();
         for _ in 0..5 {
             let pinger_clone = pinger.clone();
@@ -239,6 +369,7 @@ mod tests {
         for handle in handles {
             let reply = handle.await.unwrap()?;
             assert_loopback_success(&reply, "127.0.0.1");
+            assert_completed_between(&reply, before);
         }
 
         Ok(())
@@ -251,11 +382,14 @@ mod tests {
         let pinger2 = IcmpEchoRequestor::new("::1".parse().unwrap(), None, None, None)?;
 
         // Both should work independently
+        let before = Instant::now();
         let reply1 = pinger1.send().await?;
         let reply2 = pinger2.send().await?;
 
         assert_loopback_success(&reply1, "127.0.0.1");
         assert_loopback_success(&reply2, "::1");
+        assert_completed_between(&reply1, before);
+        assert_completed_between(&reply2, before);
 
         Ok(())
     }

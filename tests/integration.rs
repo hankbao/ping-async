@@ -2,9 +2,20 @@
 
 use std::io;
 use std::net::IpAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ping_async::{IcmpEchoReply, IcmpEchoRequestor, IcmpEchoStatus};
+
+/// Asserts that the reply's completion instant lies between `before` (taken before the
+/// `send()` that produced it) and now.
+fn assert_completed_between(reply: &IcmpEchoReply, before: Instant) {
+    let now = Instant::now();
+    assert!(
+        before <= reply.completed_at() && reply.completed_at() <= now,
+        "completed_at {:?} must lie within [{before:?}, {now:?}]",
+        reply.completed_at()
+    );
+}
 
 /// A loopback echo must come back as `Success`. `send()` reports a timeout or any other
 /// remote outcome as `Ok(reply)`, so checking `is_ok()` alone would not notice a backend
@@ -25,6 +36,7 @@ async fn test_multiple_requestors_same_target() {
     let req2 = IcmpEchoRequestor::new("127.0.0.1".parse().unwrap(), None, None, None).unwrap();
 
     // Both should work concurrently without interfering
+    let before = Instant::now();
     let (result1, result2) = tokio::join!(req1.send(), req2.send());
 
     let reply1 = result1.expect("first requestor");
@@ -32,6 +44,8 @@ async fn test_multiple_requestors_same_target() {
 
     assert_loopback_success(&reply1, "first requestor");
     assert_loopback_success(&reply2, "second requestor");
+    assert_completed_between(&reply1, before);
+    assert_completed_between(&reply2, before);
 }
 
 #[tokio::test]
@@ -39,6 +53,7 @@ async fn test_high_concurrency() {
     let req = IcmpEchoRequestor::new("127.0.0.1".parse().unwrap(), None, None, None).unwrap();
 
     // Create 50 concurrent requests to stress the system
+    let before = Instant::now();
     let futures: Vec<_> = (0..50).map(|_| req.send()).collect();
     let results = futures::future::join_all(futures).await;
 
@@ -51,6 +66,9 @@ async fn test_high_concurrency() {
         .collect();
     for reply in &replies {
         assert_eq!(reply.destination(), "127.0.0.1".parse::<IpAddr>().unwrap());
+        // Replies observed late through join_all still carry a completion instant bounded
+        // by the issue and observation instants.
+        assert_completed_between(reply, before);
     }
 
     // Nearly all must be answered. The small tolerance is only a guard against unrelated
@@ -72,10 +90,21 @@ async fn test_high_concurrency() {
 async fn test_rapid_firing() {
     let req = IcmpEchoRequestor::new("127.0.0.1".parse().unwrap(), None, None, None).unwrap();
 
-    // Rapid fire requests to stress callback unregistration
+    // Rapid fire requests to stress callback unregistration. Every reply completes no
+    // earlier than the previous one.
+    let before = Instant::now();
+    let mut previous: Option<Instant> = None;
     for i in 0..20 {
         let reply = req.send().await.expect("send must not fail locally");
         assert_loopback_success(&reply, &format!("request {i}"));
+        assert_completed_between(&reply, before);
+        if let Some(previous) = previous {
+            assert!(
+                reply.completed_at() >= previous,
+                "request {i}: sequential replies must have non-decreasing completed_at"
+            );
+        }
+        previous = Some(reply.completed_at());
     }
 }
 
@@ -103,17 +132,21 @@ async fn test_error_mapping() {
 #[tokio::test]
 async fn test_timeout_behavior() {
     // Use a non-routable address that should timeout
+    let timeout = Duration::from_millis(1000); // Short timeout
     let req = IcmpEchoRequestor::new(
         "192.0.2.1".parse().unwrap(), // RFC 5737 test network
         None,
         None,
-        Some(Duration::from_millis(1000)), // Short timeout
+        Some(timeout),
     )
     .unwrap();
 
-    let start = std::time::Instant::now();
+    let start = Instant::now();
     let result = req.send().await.unwrap();
     let elapsed = start.elapsed();
+
+    // Whatever the outcome, its completion instant lies between the send and now.
+    assert_completed_between(&result, start);
 
     match result.status() {
         // No reply at all: the local timeout must fire, and within reasonable time.
@@ -126,6 +159,19 @@ async fn test_timeout_behavior() {
                 elapsed < Duration::from_millis(1500),
                 "Should timeout within 1s"
             );
+            // On Unix the deadline timer is armed inside send() (after `start`) and never
+            // fires early, so a deadline TimedOut completes no earlier than start + timeout.
+            // It is the only Unix TimedOut with a non-zero RTT (an ICMP Time Exceeded reports
+            // zero). On Windows both the driver's own timeout, which may report early, and
+            // the deadline carry the timeout as RTT, so only the loose bound applies there.
+            if cfg!(not(windows)) && result.round_trip_time() > Duration::ZERO {
+                assert!(
+                    result.completed_at() >= start + timeout,
+                    "completed_at {:?} must not precede the deadline {:?}",
+                    result.completed_at(),
+                    start + timeout
+                );
+            }
         }
         // A gateway that rejects the documentation prefix answers with an ICMP error,
         // which is delivered as Unreachable — before the local timeout, on every platform.

@@ -35,6 +35,8 @@ async fn main() -> std::io::Result<()> {
 
 The three optional arguments of `new()` are the source address, the TTL (default 128) and the per-request timeout (default 2 seconds).
 
+Besides `destination()`, `status()` and `round_trip_time()`, a reply exposes `completed_at()`: the monotonic `Instant` at which the outcome was determined, that is, when the echo reply or the ICMP error was received and matched, or when the timeout was observed. It is meaningful for every status, whereas `round_trip_time()` carries no timing information for ICMP errors, so a caller can place a late-arriving error on its own timeline.
+
 ## Example
 
 ```bash

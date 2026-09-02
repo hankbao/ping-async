@@ -205,8 +205,17 @@ async fn run_request(
     target_addr: IpAddr,
     started_at: Instant,
 ) -> Result<IcmpEchoReply, RequestFailure> {
-    let timed_out =
-        || IcmpEchoReply::new(target_addr, IcmpEchoStatus::TimedOut, started_at.elapsed());
+    // Invoked at the moment a deadline is observed to have passed; the completion instant
+    // is taken before the elapsed time is read so that it records that observation.
+    let timed_out = || {
+        let completed_at = std::time::Instant::now();
+        IcmpEchoReply::with_completed_at(
+            target_addr,
+            IcmpEchoStatus::TimedOut,
+            started_at.elapsed(),
+            completed_at,
+        )
+    };
 
     match time::timeout_at(deadline, send_stage).await {
         Err(_elapsed) => return Ok(timed_out()),
@@ -214,11 +223,16 @@ async fn run_request(
             return match e.kind() {
                 io::ErrorKind::NetworkUnreachable
                 | io::ErrorKind::NetworkDown
-                | io::ErrorKind::HostUnreachable => Ok(IcmpEchoReply::new(
-                    target_addr,
-                    IcmpEchoStatus::Unreachable,
-                    Duration::ZERO,
-                )),
+                | io::ErrorKind::HostUnreachable => {
+                    // The send failure has been classified as an echo outcome.
+                    let completed_at = std::time::Instant::now();
+                    Ok(IcmpEchoReply::with_completed_at(
+                        target_addr,
+                        IcmpEchoStatus::Unreachable,
+                        Duration::ZERO,
+                        completed_at,
+                    ))
+                }
                 _ => Err(RequestFailure::Send(e)),
             };
         }
@@ -394,6 +408,7 @@ impl IcmpEchoRequestor {
     /// - The destination IP address
     /// - The status of the ping operation
     /// - The measured round-trip time
+    /// - The instant at which the outcome was determined
     ///
     /// # Errors
     ///
@@ -637,15 +652,18 @@ fn deliver_echo_reply(
         }
     };
 
+    // The reply has been matched to a live request: the outcome is decided.
+    let completed_at = std::time::Instant::now();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos() as u64;
     let rtt = Duration::from_nanos(now.saturating_sub(sent_timestamp));
-    let _ = entry.tx.send(IcmpEchoReply::new(
+    let _ = entry.tx.send(IcmpEchoReply::with_completed_at(
         target_addr,
         IcmpEchoStatus::Success,
         rtt,
+        completed_at,
     ));
     true
 }
@@ -666,9 +684,14 @@ fn deliver_error(
     let entry = lock_registry(registry).entries.remove(&info.sequence);
     match entry {
         Some(entry) => {
-            let _ = entry
-                .tx
-                .send(IcmpEchoReply::new(target_addr, info.status, Duration::ZERO));
+            // The error has been matched to a live request; its status is known.
+            let completed_at = std::time::Instant::now();
+            let _ = entry.tx.send(IcmpEchoReply::with_completed_at(
+                target_addr,
+                info.status,
+                Duration::ZERO,
+                completed_at,
+            ));
             true
         }
         None => false,
@@ -1200,6 +1223,18 @@ mod tests {
         Err(io::Error::from(kind))
     }
 
+    /// A deadline `TimedOut` is stamped when the timer was observed to have fired: never
+    /// before the deadline and never after the caller sees the reply.
+    fn assert_completed_at_deadline(reply: &IcmpEchoReply, deadline: Instant) {
+        let now = std::time::Instant::now();
+        assert!(
+            deadline.into_std() <= reply.completed_at() && reply.completed_at() <= now,
+            "completed_at {:?} must lie within [{:?}, {now:?}]",
+            reply.completed_at(),
+            deadline.into_std()
+        );
+    }
+
     #[tokio::test]
     async fn test_lazy_router_spawning() -> io::Result<()> {
         // Create a requestor but don't call send() yet
@@ -1378,10 +1413,16 @@ mod tests {
         );
 
         let fresh = echo_reply_packet(target, identifier, seq, 2);
+        let before = std::time::Instant::now();
         assert!(deliver_echo_reply(&registry, identifier, target, &fresh));
+        let after = std::time::Instant::now();
         assert!(!lock_registry(&registry).entries.contains_key(&seq));
         let reply = rx.try_recv().unwrap().expect("exactly one delivery");
         assert_eq!(reply.status(), IcmpEchoStatus::Success);
+        assert!(
+            before <= reply.completed_at() && reply.completed_at() <= after,
+            "completed_at must be stamped at delivery"
+        );
 
         let again = echo_reply_packet(target, identifier, seq, 2);
         assert!(!deliver_echo_reply(&registry, identifier, target, &again));
@@ -1408,17 +1449,12 @@ mod tests {
         };
 
         let started = Instant::now();
-        let result = run_request(
-            started + Duration::from_millis(50),
-            futures::future::pending(),
-            rx,
-            target(),
-            started,
-        )
-        .await;
+        let deadline = started + Duration::from_millis(50);
+        let result = run_request(deadline, futures::future::pending(), rx, target(), started).await;
         let reply = result.expect("timed out reply");
         assert_eq!(reply.status(), IcmpEchoStatus::TimedOut);
         assert!(started.elapsed() < Duration::from_millis(150));
+        assert_completed_at_deadline(&reply, deadline);
 
         drop(guard);
         assert!(lock_registry(&registry).entries.is_empty());
@@ -1428,18 +1464,14 @@ mod tests {
     async fn run_request_no_reply_times_out_at_deadline() {
         let (_tx, rx) = oneshot::channel();
         let started = Instant::now();
-        let reply = run_request(
-            started + Duration::from_millis(50),
-            async { Ok(()) },
-            rx,
-            target(),
-            started,
-        )
-        .await
-        .unwrap();
+        let deadline = started + Duration::from_millis(50);
+        let reply = run_request(deadline, async { Ok(()) }, rx, target(), started)
+            .await
+            .unwrap();
         assert_eq!(reply.status(), IcmpEchoStatus::TimedOut);
         let elapsed = started.elapsed();
         assert!(elapsed >= Duration::from_millis(45) && elapsed < Duration::from_millis(150));
+        assert_completed_at_deadline(&reply, deadline);
     }
 
     #[tokio::test]
@@ -1481,6 +1513,11 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(reply.status(), IcmpEchoStatus::Unreachable);
+        let now = std::time::Instant::now();
+        assert!(
+            started.into_std() <= reply.completed_at() && reply.completed_at() <= now,
+            "completed_at must be stamped at classification"
+        );
 
         let (_tx, rx) = oneshot::channel();
         let result = run_request(
@@ -1498,8 +1535,9 @@ mod tests {
     async fn run_request_slow_send_stage_is_bounded_by_deadline() {
         let (_tx, rx) = oneshot::channel();
         let started = Instant::now();
+        let deadline = started + Duration::from_millis(50);
         let reply = run_request(
-            started + Duration::from_millis(50),
+            deadline,
             async {
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 Ok(())
@@ -1512,6 +1550,7 @@ mod tests {
         .unwrap();
         assert_eq!(reply.status(), IcmpEchoStatus::TimedOut);
         assert!(started.elapsed() < Duration::from_millis(150));
+        assert_completed_at_deadline(&reply, deadline);
     }
 
     #[tokio::test]
@@ -1844,11 +1883,17 @@ mod tests {
                     }],
                 }
             };
+            let before = std::time::Instant::now();
             let step = handle_wake(&mut state, err(kind), &[], &mut drain);
+            let after = std::time::Instant::now();
             assert_eq!(step, RouterStep::Continue, "{kind:?}");
             assert_eq!(calls.get(), 1, "drainer called exactly once ({kind:?})");
             let reply = rx.try_recv().unwrap().expect("waiter resolved");
             assert_eq!(reply.status(), IcmpEchoStatus::Unreachable);
+            assert!(
+                before <= reply.completed_at() && reply.completed_at() <= after,
+                "completed_at must be stamped at delivery ({kind:?})"
+            );
             assert!(!lock_registry(&state.registry).entries.contains_key(&seq));
             assert_eq!(state.errqueue_drained.load(Ordering::SeqCst), 1);
             assert_eq!(state.last_gen, 1);
@@ -1873,10 +1918,16 @@ mod tests {
         };
         buf[..datagram.len()].copy_from_slice(&datagram);
         let mut drain = || panic!("drainer must not be called for a datagram");
+        let before = std::time::Instant::now();
         let step = handle_wake(&mut state, Ok(datagram.len()), &buf, &mut drain);
+        let after = std::time::Instant::now();
         assert_eq!(step, RouterStep::Continue);
         let reply = rx.try_recv().unwrap().expect("echo reply delivered");
         assert_eq!(reply.status(), IcmpEchoStatus::Success);
+        assert!(
+            before <= reply.completed_at() && reply.completed_at() <= after,
+            "completed_at must be stamped at delivery"
+        );
         assert_eq!(state.errqueue_drained.load(Ordering::SeqCst), 0);
     }
 

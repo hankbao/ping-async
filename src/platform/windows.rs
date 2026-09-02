@@ -8,7 +8,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddrV6};
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
@@ -235,10 +235,14 @@ impl RequestContext {
 
                 if parsed != 0 {
                     let addr = IpAddr::V4(u32::from_be(header.Address).into());
-                    IcmpEchoReply::new(
+                    let status = ip_error_to_icmp_status(header.Status);
+                    // The driver's result has been decoded: the outcome is decided.
+                    let completed_at = Instant::now();
+                    IcmpEchoReply::with_completed_at(
                         addr,
-                        ip_error_to_icmp_status(header.Status),
+                        status,
                         Duration::from_millis(header.RoundTripTime.into()),
+                        completed_at,
                     )
                 } else {
                     self.failed_reply(failed_request_status(header.Status, last_error))
@@ -254,10 +258,14 @@ impl RequestContext {
                     let mut addr_raw = IN6_ADDR::default();
                     addr_raw.u.Word = header.Address.sin6_addr;
                     let addr = IpAddr::V6(addr_raw.into());
-                    IcmpEchoReply::new(
+                    let status = ip_error_to_icmp_status(header.Status);
+                    // The driver's result has been decoded: the outcome is decided.
+                    let completed_at = Instant::now();
+                    IcmpEchoReply::with_completed_at(
                         addr,
-                        ip_error_to_icmp_status(header.Status),
+                        status,
                         Duration::from_millis(header.RoundTripTime.into()),
+                        completed_at,
                     )
                 } else {
                     self.failed_reply(failed_request_status(header.Status, last_error))
@@ -268,12 +276,14 @@ impl RequestContext {
     }
 
     fn failed_reply(&self, status: IcmpEchoStatus) -> IcmpEchoReply {
+        // The caller has established the status: the outcome is decided here.
+        let completed_at = Instant::now();
         let rtt = if status == IcmpEchoStatus::TimedOut {
             self.timeout
         } else {
             Duration::ZERO
         };
-        IcmpEchoReply::new(self.target_addr, status, rtt)
+        IcmpEchoReply::with_completed_at(self.target_addr, status, rtt, completed_at)
     }
 }
 
@@ -348,16 +358,24 @@ fn immediate_failure_result(
     timeout: Duration,
 ) -> io::Result<IcmpEchoReply> {
     match ip_error_to_icmp_status(code) {
-        IcmpEchoStatus::TimedOut => Ok(IcmpEchoReply::new(
-            target_addr,
-            IcmpEchoStatus::TimedOut,
-            timeout,
-        )),
-        IcmpEchoStatus::Unreachable => Ok(IcmpEchoReply::new(
-            target_addr,
-            IcmpEchoStatus::Unreachable,
-            Duration::ZERO,
-        )),
+        IcmpEchoStatus::TimedOut => {
+            let completed_at = Instant::now();
+            Ok(IcmpEchoReply::with_completed_at(
+                target_addr,
+                IcmpEchoStatus::TimedOut,
+                timeout,
+                completed_at,
+            ))
+        }
+        IcmpEchoStatus::Unreachable => {
+            let completed_at = Instant::now();
+            Ok(IcmpEchoReply::with_completed_at(
+                target_addr,
+                IcmpEchoStatus::Unreachable,
+                Duration::ZERO,
+                completed_at,
+            ))
+        }
         _ if code == 0 => Err(io::Error::other(
             "ICMP echo request was rejected without an error code",
         )),
@@ -543,6 +561,7 @@ impl IcmpEchoRequestor {
     /// - The destination IP address
     /// - The status of the ping operation
     /// - The measured round-trip time
+    /// - The instant at which the outcome was determined
     ///
     /// # Errors
     ///
@@ -622,11 +641,16 @@ async fn await_reply(
     match tokio::time::timeout(timeout, reply_rx).await {
         Ok(Ok(result)) => result,
         Ok(Err(_canceled)) => Err(io::Error::other("reply channel closed unexpectedly")),
-        Err(_elapsed) => Ok(IcmpEchoReply::new(
-            target_addr,
-            IcmpEchoStatus::TimedOut,
-            timeout,
-        )),
+        Err(_elapsed) => {
+            // The deadline has been observed to pass: the outcome is decided.
+            let completed_at = Instant::now();
+            Ok(IcmpEchoReply::with_completed_at(
+                target_addr,
+                IcmpEchoStatus::TimedOut,
+                timeout,
+                completed_at,
+            ))
+        }
     }
 }
 
@@ -850,7 +874,6 @@ unsafe extern "system" fn wait_callback(ptr: *mut c_void, _timer_fired: bool) {
 mod tests {
     use super::*;
     use std::sync::Weak;
-    use std::time::Instant;
 
     use windows::Win32::NetworkManagement::IpHelper::{
         IP_DEST_HOST_UNREACHABLE, IP_REQ_TIMED_OUT, IP_SUCCESS,
@@ -860,6 +883,17 @@ mod tests {
         stats.contexts_live.load(Ordering::SeqCst) == 0
             && stats.waits_registered.load(Ordering::SeqCst) == 0
             && stats.events_open.load(Ordering::SeqCst) == 0
+    }
+
+    /// The reply's completion instant lies between `before` (taken before the request was
+    /// started) and now.
+    fn assert_completed_between(reply: &IcmpEchoReply, before: Instant) {
+        let now = Instant::now();
+        assert!(
+            before <= reply.completed_at() && reply.completed_at() <= now,
+            "completed_at {:?} must lie within [{before:?}, {now:?}]",
+            reply.completed_at()
+        );
     }
 
     async fn wait_until_clean(stats: &RequestStats, cap: Duration) -> bool {
@@ -1032,17 +1066,25 @@ mod tests {
 
         let target: IpAddr = "127.0.0.1".parse().unwrap();
         let timeout = Duration::from_millis(750);
+        let before = Instant::now();
+        // Every reply is stamped at classification: after `before`, no later than the check.
+        let stamped_now = |reply: &IcmpEchoReply| {
+            before <= reply.completed_at() && reply.completed_at() <= Instant::now()
+        };
 
         // Echo outcomes the driver reports immediately are replies.
         let reply = immediate_failure_result(IP_REQ_TIMED_OUT, target, timeout).unwrap();
         assert_eq!(reply.status(), IcmpEchoStatus::TimedOut);
         assert_eq!(reply.round_trip_time(), timeout);
         assert_eq!(reply.destination(), target);
+        assert!(stamped_now(&reply));
         let reply = immediate_failure_result(IP_DEST_HOST_UNREACHABLE, target, timeout).unwrap();
         assert_eq!(reply.status(), IcmpEchoStatus::Unreachable);
         assert_eq!(reply.round_trip_time(), Duration::ZERO);
+        assert!(stamped_now(&reply));
         let reply = immediate_failure_result(ERROR_HOST_UNREACHABLE.0, target, timeout).unwrap();
         assert_eq!(reply.status(), IcmpEchoStatus::Unreachable);
+        assert!(stamped_now(&reply));
 
         // Local Win32 failures keep their OS error code and kind.
         let err = immediate_failure_result(ERROR_INVALID_PARAMETER.0, target, timeout).unwrap_err();
@@ -1076,18 +1118,22 @@ mod tests {
     #[tokio::test]
     async fn stub_failed_timed_out_maps_and_cleans() {
         let fx = fixture("127.0.0.1", Duration::from_secs(1));
+        let before = Instant::now();
         let (rx, _ev) = start_stub(&fx, SendOutcome::Failed(IP_REQ_TIMED_OUT));
         let reply = rx.await.unwrap().unwrap();
         assert_eq!(reply.status(), IcmpEchoStatus::TimedOut);
+        assert_completed_between(&reply, before);
         assert!(wait_until_clean(&fx.stats, Duration::from_secs(2)).await);
     }
 
     #[tokio::test]
     async fn stub_failed_unreachable_maps_and_cleans() {
         let fx = fixture("127.0.0.1", Duration::from_secs(1));
+        let before = Instant::now();
         let (rx, _ev) = start_stub(&fx, SendOutcome::Failed(IP_DEST_HOST_UNREACHABLE));
         let reply = rx.await.unwrap().unwrap();
         assert_eq!(reply.status(), IcmpEchoStatus::Unreachable);
+        assert_completed_between(&reply, before);
         assert!(wait_until_clean(&fx.stats, Duration::from_secs(2)).await);
     }
 
@@ -1329,6 +1375,7 @@ mod tests {
     #[tokio::test]
     async fn stub_completed_drives_callback_via_manual_signal() {
         let fx = fixture("127.0.0.1", Duration::from_secs(1));
+        let before = Instant::now();
         let (rx, _ev) = start_stub(&fx, SendOutcome::Completed);
         let result = tokio::time::timeout(Duration::from_secs(1), rx).await;
         let reply = result
@@ -1336,6 +1383,33 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_ne!(reply.status(), IcmpEchoStatus::Success);
+        // The zeroed stub buffer does not parse, so this reply was built by `failed_reply`.
+        assert_completed_between(&reply, before);
+        assert!(wait_until_clean(&fx.stats, Duration::from_secs(2)).await);
+    }
+
+    /// The deadline wrapper stamps its `TimedOut` when the timer fires: never before the
+    /// deadline, never after the caller observes the reply.
+    #[tokio::test]
+    async fn await_reply_deadline_stamps_completion() {
+        let fx = fixture("127.0.0.1", Duration::from_secs(1));
+        let (rx, ev) = start_stub(&fx, SendOutcome::Pending);
+        let deadline = Duration::from_millis(50);
+        let before = Instant::now();
+        let reply = await_reply(deadline, fx.requestor.inner.target_addr, rx)
+            .await
+            .unwrap();
+        let after = Instant::now();
+        assert_eq!(reply.status(), IcmpEchoStatus::TimedOut);
+        assert_eq!(reply.round_trip_time(), deadline);
+        assert!(
+            before + deadline <= reply.completed_at() && reply.completed_at() <= after,
+            "completed_at {:?} must lie within [{:?}, {after:?}]",
+            reply.completed_at(),
+            before + deadline
+        );
+        // The "driver" is still busy; signal it so the callback cleans up.
+        ev.signal();
         assert!(wait_until_clean(&fx.stats, Duration::from_secs(2)).await);
     }
 

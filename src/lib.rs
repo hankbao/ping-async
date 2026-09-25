@@ -61,6 +61,12 @@ pub const PING_DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
 /// This matches the default payload size used by most ping implementations.
 pub const PING_DEFAULT_REQUEST_DATA_LENGTH: usize = 32;
 
+/// Minimum exact payload length accepted by [`IcmpEchoRequestor::with_payload_len`].
+pub const PING_MIN_REQUEST_DATA_LENGTH: usize = 0;
+
+/// Maximum exact payload length accepted by [`IcmpEchoRequestor::with_payload_len`].
+pub const PING_MAX_REQUEST_DATA_LENGTH: usize = 1024;
+
 /// Status of an ICMP echo request/reply exchange.
 ///
 /// This enum represents the different outcomes that can occur when sending
@@ -69,15 +75,19 @@ pub const PING_DEFAULT_REQUEST_DATA_LENGTH: usize = 32;
 pub enum IcmpEchoStatus {
     /// The echo request was successful and a reply was received.
     Success,
-    /// The echo request timed out - no reply was received within the timeout period.
+    /// The local request deadline elapsed before a reply was received.
     TimedOut,
-    /// The destination was unreachable (network, host, port, or protocol unreachable).
+    /// A received ICMP error made the destination or an intermediate router unreachable.
     Unreachable,
     /// An unknown error occurred during the ping operation.
     Unknown,
 }
 
 impl IcmpEchoStatus {
+    pub fn from_outcome(outcome: IcmpOutcome) -> Self {
+        outcome.coarse()
+    }
+
     /// Converts the status to a `Result`, returning `Ok(())` for success or an error message for failures.
     ///
     /// # Examples
@@ -101,15 +111,79 @@ impl IcmpEchoStatus {
     }
 }
 
+/// Fine-grained outcome of an ICMP echo request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IcmpOutcome {
+    /// An Echo Reply matched the request.
+    EchoReply,
+    /// The local request deadline elapsed.
+    LocalTimeout,
+    /// A received ICMP Time Exceeded matched the request.
+    TimeExceeded,
+    /// A received Destination Unreachable did not expose a narrower subtype.
+    DestinationUnreachable,
+    /// IPv6 Destination Unreachable, code 0.
+    NoRoute,
+    /// IPv4 Destination Unreachable, code 0.
+    NetworkUnreachable,
+    /// IPv4 Destination Unreachable, code 1.
+    HostUnreachable,
+    /// Destination Unreachable port subtype.
+    PortUnreachable,
+    /// Destination Unreachable protocol subtype.
+    ProtocolUnreachable,
+    /// A recognized error without a narrower public subtype.
+    Other,
+}
+
+impl IcmpOutcome {
+    /// Projects this outcome onto the legacy coarse status.
+    pub fn coarse(self) -> IcmpEchoStatus {
+        match self {
+            Self::EchoReply => IcmpEchoStatus::Success,
+            Self::LocalTimeout => IcmpEchoStatus::TimedOut,
+            Self::TimeExceeded
+            | Self::DestinationUnreachable
+            | Self::NoRoute
+            | Self::NetworkUnreachable
+            | Self::HostUnreachable
+            | Self::PortUnreachable
+            | Self::ProtocolUnreachable => IcmpEchoStatus::Unreachable,
+            Self::Other => IcmpEchoStatus::Unknown,
+        }
+    }
+
+    /// Reconstructs an outcome from a legacy coarse status.
+    pub fn from_status(status: IcmpEchoStatus) -> Self {
+        match status {
+            IcmpEchoStatus::Success => Self::EchoReply,
+            IcmpEchoStatus::TimedOut => Self::LocalTimeout,
+            IcmpEchoStatus::Unreachable => Self::DestinationUnreachable,
+            IcmpEchoStatus::Unknown => Self::Other,
+        }
+    }
+}
+
+impl From<IcmpEchoStatus> for IcmpOutcome {
+    fn from(status: IcmpEchoStatus) -> Self {
+        Self::from_status(status)
+    }
+}
+
+impl From<IcmpOutcome> for IcmpEchoStatus {
+    fn from(outcome: IcmpOutcome) -> Self {
+        outcome.coarse()
+    }
+}
+
 /// Reply received from an ICMP echo request.
-///
-/// Contains the destination IP address, the status of the ping operation,
-/// the measured round-trip time, and the monotonic instant at which the
-/// outcome was determined (see [`completed_at`](Self::completed_at)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IcmpEchoReply {
     destination: IpAddr,
     status: IcmpEchoStatus,
+    outcome: IcmpOutcome,
+    responder: Option<IpAddr>,
+    sequence: Option<u16>,
     round_trip_time: Duration,
     completed_at: Instant,
 }
@@ -154,9 +228,52 @@ impl IcmpEchoReply {
         round_trip_time: Duration,
         completed_at: Instant,
     ) -> Self {
+        Self::with_evidence(
+            destination,
+            status,
+            IcmpOutcome::from_status(status),
+            None,
+            None,
+            round_trip_time,
+            completed_at,
+        )
+    }
+
+    pub fn with_responder_and_outcome(
+        destination: IpAddr,
+        status: IcmpEchoStatus,
+        outcome: IcmpOutcome,
+        responder: Option<IpAddr>,
+        round_trip_time: Duration,
+        completed_at: Instant,
+    ) -> Self {
+        Self::with_evidence(
+            destination,
+            status,
+            outcome,
+            responder,
+            None,
+            round_trip_time,
+            completed_at,
+        )
+    }
+
+    /// Creates a reply with all observation fields specified.
+    pub fn with_evidence(
+        destination: IpAddr,
+        status: IcmpEchoStatus,
+        outcome: IcmpOutcome,
+        responder: Option<IpAddr>,
+        sequence: Option<u16>,
+        round_trip_time: Duration,
+        completed_at: Instant,
+    ) -> Self {
         Self {
             destination,
             status,
+            outcome,
+            responder,
+            sequence,
             round_trip_time,
             completed_at,
         }
@@ -167,9 +284,24 @@ impl IcmpEchoReply {
         self.destination
     }
 
-    /// Returns the status of the ping operation.
+    /// Returns the coarse status of the ping operation.
     pub fn status(&self) -> IcmpEchoStatus {
         self.status
+    }
+
+    /// Returns the fine-grained outcome.
+    pub fn outcome(&self) -> IcmpOutcome {
+        self.outcome
+    }
+
+    /// Returns the observed source address, when the platform exposed it.
+    pub fn responder(&self) -> Option<IpAddr> {
+        self.responder
+    }
+
+    /// Returns the ICMP sequence number, when the backend exposed it.
+    pub fn sequence(&self) -> Option<u16> {
+        self.sequence
     }
 
     /// Returns the measured round-trip time.
@@ -191,16 +323,10 @@ impl IcmpEchoReply {
     ///
     /// - [`Success`](IcmpEchoStatus::Success): when the echo reply was received and
     ///   matched to the request.
-    /// - [`Unreachable`](IcmpEchoStatus::Unreachable) / [`Unknown`](IcmpEchoStatus::Unknown),
-    ///   and a [`TimedOut`](IcmpEchoStatus::TimedOut) mapped from an ICMP Time Exceeded
-    ///   message or from a driver-reported timeout on Windows: when the ICMP error or the
-    ///   driver's result was received and matched, or when a local send failure was
-    ///   classified as that status.
-    /// - [`TimedOut`](IcmpEchoStatus::TimedOut) from the request deadline: when the
-    ///   library observed that the deadline had passed, which is never before the
-    ///   `send()` call plus the timeout. On Windows the driver applies its own timeout as
-    ///   well and may report it marginally before the nominal deadline; such a reply is
-    ///   stamped when the driver's result was decoded.
+    /// - [`Unreachable`](IcmpEchoStatus::Unreachable) for a received ICMP error.
+    /// - [`TimedOut`](IcmpEchoStatus::TimedOut) only for the local request deadline.
+    ///   On Windows the driver may report its own timeout before the Tokio deadline; that
+    ///   reply is a received driver outcome and is not represented as a local deadline.
     ///
     /// In every case the instant is taken once the reply's status is established and
     /// before the round-trip time is computed or the reply is delivered. It is never
@@ -226,8 +352,10 @@ impl IcmpEchoReply {
     /// ```
     ///
     /// For a reply built with [`new`](Self::new) this is the instant of construction;
-    /// for one built with [`with_completed_at`](Self::with_completed_at) it is whatever
-    /// the caller supplied.
+    /// for one built with [`with_completed_at`](Self::with_completed_at) or
+    /// [`with_evidence`](Self::with_evidence) or
+    /// [`with_responder_and_outcome`](Self::with_responder_and_outcome) it is whatever the
+    /// caller supplied.
     pub fn completed_at(&self) -> Instant {
         self.completed_at
     }
@@ -245,6 +373,56 @@ mod tests {
             before <= reply.completed_at() && reply.completed_at() <= now,
             "completed_at {:?} must lie within [{before:?}, {now:?}]",
             reply.completed_at()
+        );
+    }
+
+    #[test]
+    fn outcome_projection_is_stable() {
+        let cases = [
+            (IcmpOutcome::EchoReply, IcmpEchoStatus::Success),
+            (IcmpOutcome::LocalTimeout, IcmpEchoStatus::TimedOut),
+            (IcmpOutcome::TimeExceeded, IcmpEchoStatus::Unreachable),
+            (
+                IcmpOutcome::DestinationUnreachable,
+                IcmpEchoStatus::Unreachable,
+            ),
+            (IcmpOutcome::NoRoute, IcmpEchoStatus::Unreachable),
+            (IcmpOutcome::NetworkUnreachable, IcmpEchoStatus::Unreachable),
+            (IcmpOutcome::HostUnreachable, IcmpEchoStatus::Unreachable),
+            (IcmpOutcome::PortUnreachable, IcmpEchoStatus::Unreachable),
+            (
+                IcmpOutcome::ProtocolUnreachable,
+                IcmpEchoStatus::Unreachable,
+            ),
+            (IcmpOutcome::Other, IcmpEchoStatus::Unknown),
+        ];
+        for (outcome, status) in cases {
+            assert_eq!(outcome.coarse(), status);
+        }
+        assert_eq!(
+            IcmpOutcome::from(IcmpEchoStatus::TimedOut),
+            IcmpOutcome::LocalTimeout
+        );
+    }
+
+    #[test]
+    fn evidence_constructor_preserves_all_observation_fields() {
+        let target = "127.0.0.1".parse().unwrap();
+        let responder = "127.0.0.2".parse().unwrap();
+        let reply = IcmpEchoReply::with_responder_and_outcome(
+            target,
+            IcmpEchoStatus::Unreachable,
+            IcmpOutcome::HostUnreachable,
+            Some(responder),
+            Duration::ZERO,
+            Instant::now(),
+        );
+        assert_eq!(reply.destination(), target);
+        assert_eq!(reply.outcome(), IcmpOutcome::HostUnreachable);
+        assert_eq!(reply.responder(), Some(responder));
+        assert_eq!(
+            IcmpEchoStatus::from_outcome(IcmpOutcome::TimeExceeded),
+            IcmpEchoStatus::Unreachable
         );
     }
 

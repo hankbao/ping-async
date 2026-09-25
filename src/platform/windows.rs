@@ -45,23 +45,17 @@ use windows::Win32::NetworkManagement::IpHelper::IP_OPTION_INFORMATION;
 use windows::Win32::NetworkManagement::IpHelper::IP_OPTION_INFORMATION32 as IP_OPTION_INFORMATION;
 
 use crate::{
-    IcmpEchoReply, IcmpEchoStatus, PING_DEFAULT_REQUEST_DATA_LENGTH, PING_DEFAULT_TIMEOUT,
-    PING_DEFAULT_TTL,
+    IcmpEchoReply, IcmpEchoStatus, IcmpOutcome, PING_DEFAULT_REQUEST_DATA_LENGTH,
+    PING_DEFAULT_TIMEOUT, PING_DEFAULT_TTL, PING_MAX_REQUEST_DATA_LENGTH,
+    PING_MIN_REQUEST_DATA_LENGTH,
 };
 
-const REPLY_BUFFER_SIZE: usize = 100;
+const REPLY_BUFFER_SIZE: usize =
+    size_of::<ICMP_ECHO_REPLY>() + PING_MAX_REQUEST_DATA_LENGTH + 8 + size_of::<IO_STATUS_BLOCK>();
 
-// we don't provide request data, so no need of allocating space for it
-const_assert!(
-    size_of::<ICMP_ECHO_REPLY>()
-        + PING_DEFAULT_REQUEST_DATA_LENGTH
-        + 8
-        + size_of::<IO_STATUS_BLOCK>()
-        <= REPLY_BUFFER_SIZE
-);
 const_assert!(
     size_of::<ICMPV6_ECHO_REPLY>()
-        + PING_DEFAULT_REQUEST_DATA_LENGTH
+        + PING_MAX_REQUEST_DATA_LENGTH
         + 8
         + size_of::<IO_STATUS_BLOCK>()
         <= REPLY_BUFFER_SIZE
@@ -152,6 +146,17 @@ struct RequestContext {
 /// echo result (including remote timeouts and unreachable destinations), or an
 /// `io::Error` for a local failure of the send API.
 type ReplySender = oneshot::Sender<io::Result<IcmpEchoReply>>;
+
+fn responder_v4(address: u32) -> Option<IpAddr> {
+    let address = IpAddr::V4(Ipv4Addr::from(u32::from_be(address)));
+    (!address.is_unspecified()).then_some(address)
+}
+
+fn responder_v6(address: IN6_ADDR) -> Option<IpAddr> {
+    let address = IpAddr::V6(address.into());
+    (!address.is_unspecified()).then_some(address)
+}
+
 #[cfg(test)]
 type ReplyReceiver = oneshot::Receiver<io::Result<IcmpEchoReply>>;
 
@@ -234,18 +239,20 @@ impl RequestContext {
                 let header: ICMP_ECHO_REPLY = ptr::read_unaligned(buf.cast::<ICMP_ECHO_REPLY>());
 
                 if parsed != 0 {
-                    let addr = IpAddr::V4(u32::from_be(header.Address).into());
-                    let status = ip_error_to_icmp_status(header.Status);
-                    // The driver's result has been decoded: the outcome is decided.
+                    let outcome = ip_error_to_icmp_outcome(header.Status);
                     let completed_at = Instant::now();
-                    IcmpEchoReply::with_completed_at(
-                        addr,
-                        status,
+                    IcmpEchoReply::with_evidence(
+                        self.target_addr,
+                        ip_error_to_icmp_status(header.Status),
+                        outcome,
+                        responder_v4(header.Address),
+                        None,
                         Duration::from_millis(header.RoundTripTime.into()),
                         completed_at,
                     )
                 } else {
-                    self.failed_reply(failed_request_status(header.Status, last_error))
+                    let outcome = failed_request_outcome(header.Status, last_error);
+                    self.failed_reply(failed_request_status(header.Status, last_error), outcome)
                 }
             }
             IpAddr::V6(_) => {
@@ -255,35 +262,44 @@ impl RequestContext {
                     ptr::read_unaligned(buf.cast::<ICMPV6_ECHO_REPLY>());
 
                 if parsed != 0 {
+                    let outcome = ip_error_to_icmp_outcome(header.Status);
                     let mut addr_raw = IN6_ADDR::default();
                     addr_raw.u.Word = header.Address.sin6_addr;
-                    let addr = IpAddr::V6(addr_raw.into());
-                    let status = ip_error_to_icmp_status(header.Status);
-                    // The driver's result has been decoded: the outcome is decided.
                     let completed_at = Instant::now();
-                    IcmpEchoReply::with_completed_at(
-                        addr,
-                        status,
+                    IcmpEchoReply::with_evidence(
+                        self.target_addr,
+                        ip_error_to_icmp_status(header.Status),
+                        outcome,
+                        responder_v6(addr_raw),
+                        None,
                         Duration::from_millis(header.RoundTripTime.into()),
                         completed_at,
                     )
                 } else {
-                    self.failed_reply(failed_request_status(header.Status, last_error))
+                    let outcome = failed_request_outcome(header.Status, last_error);
+                    self.failed_reply(failed_request_status(header.Status, last_error), outcome)
                 }
             }
         };
         Ok(reply)
     }
 
-    fn failed_reply(&self, status: IcmpEchoStatus) -> IcmpEchoReply {
-        // The caller has established the status: the outcome is decided here.
+    fn failed_reply(&self, status: IcmpEchoStatus, outcome: IcmpOutcome) -> IcmpEchoReply {
         let completed_at = Instant::now();
-        let rtt = if status == IcmpEchoStatus::TimedOut {
+        let rtt = if outcome == IcmpOutcome::LocalTimeout {
             self.timeout
         } else {
             Duration::ZERO
         };
-        IcmpEchoReply::with_completed_at(self.target_addr, status, rtt, completed_at)
+        IcmpEchoReply::with_evidence(
+            self.target_addr,
+            status,
+            outcome,
+            None,
+            None,
+            rtt,
+            completed_at,
+        )
     }
 }
 
@@ -357,32 +373,48 @@ fn immediate_failure_result(
     target_addr: IpAddr,
     timeout: Duration,
 ) -> io::Result<IcmpEchoReply> {
-    match ip_error_to_icmp_status(code) {
-        IcmpEchoStatus::TimedOut => {
+    let outcome = ip_error_to_icmp_outcome(code);
+    match outcome {
+        IcmpOutcome::LocalTimeout => {
             let completed_at = Instant::now();
-            Ok(IcmpEchoReply::with_completed_at(
+            Ok(IcmpEchoReply::with_evidence(
                 target_addr,
-                IcmpEchoStatus::TimedOut,
+                outcome.coarse(),
+                outcome,
+                None,
+                None,
                 timeout,
                 completed_at,
             ))
         }
-        IcmpEchoStatus::Unreachable => {
+        IcmpOutcome::TimeExceeded
+        | IcmpOutcome::DestinationUnreachable
+        | IcmpOutcome::NoRoute
+        | IcmpOutcome::NetworkUnreachable
+        | IcmpOutcome::HostUnreachable
+        | IcmpOutcome::PortUnreachable
+        | IcmpOutcome::ProtocolUnreachable => {
             let completed_at = Instant::now();
-            Ok(IcmpEchoReply::with_completed_at(
+            Ok(IcmpEchoReply::with_evidence(
                 target_addr,
-                IcmpEchoStatus::Unreachable,
+                outcome.coarse(),
+                outcome,
+                None,
+                None,
                 Duration::ZERO,
                 completed_at,
             ))
         }
-        _ if code == 0 => Err(io::Error::other(
+        IcmpOutcome::Other if code == 0 => Err(io::Error::other(
             "ICMP echo request was rejected without an error code",
         )),
-        _ if is_ip_status(code) => Err(io::Error::other(format!(
+        IcmpOutcome::Other if is_ip_status(code) => Err(io::Error::other(format!(
             "ICMP echo request was rejected with IP_STATUS {code}"
         ))),
-        _ => Err(io::Error::from_raw_os_error(code as i32)),
+        IcmpOutcome::Other => Err(io::Error::from_raw_os_error(code as i32)),
+        IcmpOutcome::EchoReply => Err(io::Error::other(
+            "ICMP echo request was rejected with a success status",
+        )),
     }
 }
 
@@ -392,17 +424,18 @@ fn immediate_failure_result(
 /// us, so non-zero is meaningful), then `GetLastError()` if non-zero, else `Unknown`. A
 /// failed request is never reported as `Success`.
 fn failed_request_status(header_status: u32, last_error: u32) -> IcmpEchoStatus {
+    failed_request_outcome(header_status, last_error).coarse()
+}
+
+fn failed_request_outcome(header_status: u32, last_error: u32) -> IcmpOutcome {
     let code = if header_status != 0 {
         header_status
     } else {
         last_error
     };
-    if code == 0 {
-        return IcmpEchoStatus::Unknown;
-    }
-    match ip_error_to_icmp_status(code) {
-        IcmpEchoStatus::Success => IcmpEchoStatus::Unknown,
-        status => status,
+    match ip_error_to_icmp_outcome(code) {
+        IcmpOutcome::EchoReply | IcmpOutcome::Other => IcmpOutcome::Other,
+        outcome => outcome,
     }
 }
 
@@ -444,6 +477,7 @@ struct RequestorInner {
     source_addr: IpAddr,
     ttl: u8,
     timeout: Duration,
+    payload_len: usize,
     #[cfg(test)]
     stats: Arc<RequestStats>,
 }
@@ -499,7 +533,31 @@ impl IcmpEchoRequestor {
         ttl: Option<u8>,
         timeout: Option<Duration>,
     ) -> io::Result<Self> {
-        // Check if the target address matches the source address type
+        Self::with_payload_len(
+            target_addr,
+            source_addr,
+            ttl,
+            timeout,
+            PING_DEFAULT_REQUEST_DATA_LENGTH,
+        )
+    }
+
+    pub fn with_payload_len(
+        target_addr: IpAddr,
+        source_addr: Option<IpAddr>,
+        ttl: Option<u8>,
+        timeout: Option<Duration>,
+        payload_len: usize,
+    ) -> io::Result<Self> {
+        if !(PING_MIN_REQUEST_DATA_LENGTH..=PING_MAX_REQUEST_DATA_LENGTH).contains(&payload_len) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "payload_len {payload_len} is outside {PING_MIN_REQUEST_DATA_LENGTH}..={PING_MAX_REQUEST_DATA_LENGTH}"
+                ),
+            ));
+        }
+
         match (target_addr, source_addr) {
             (IpAddr::V4(_), Some(IpAddr::V6(_))) | (IpAddr::V6(_), Some(IpAddr::V4(_))) => {
                 return Err(io::Error::new(
@@ -532,10 +590,15 @@ impl IcmpEchoRequestor {
                 source_addr,
                 ttl,
                 timeout,
+                payload_len,
                 #[cfg(test)]
                 stats: Arc::new(RequestStats::default()),
             }),
         })
+    }
+
+    pub fn payload_len(&self) -> usize {
+        self.inner.payload_len
     }
 
     /// Sends an ICMP echo request and waits for a reply.
@@ -644,9 +707,12 @@ async fn await_reply(
         Err(_elapsed) => {
             // The deadline has been observed to pass: the outcome is decided.
             let completed_at = Instant::now();
-            Ok(IcmpEchoReply::with_completed_at(
+            Ok(IcmpEchoReply::with_evidence(
                 target_addr,
                 IcmpEchoStatus::TimedOut,
+                IcmpOutcome::LocalTimeout,
+                None,
+                None,
                 timeout,
                 completed_at,
             ))
@@ -672,7 +738,9 @@ impl RequestorInner {
             ..Default::default()
         };
 
-        let req_data = [0u8; PING_DEFAULT_REQUEST_DATA_LENGTH];
+        let req_data = vec![0u8; self.payload_len];
+        let req_ptr = req_data.as_ptr().cast::<c_void>();
+        let req_len = self.payload_len as u16;
         let timeout_ms = driver_timeout_ms(self.timeout);
 
         let ret = match (self.target_addr, self.source_addr) {
@@ -684,8 +752,8 @@ impl RequestorInner {
                     None,
                     u32::from(saddr).to_be(),
                     u32::from(taddr).to_be(),
-                    req_data.as_ptr() as *const _,
-                    req_data.len() as u16,
+                    req_ptr,
+                    req_len,
                     Some(&ip_option as *const _ as *const _),
                     buffer as *mut _,
                     buffer_len,
@@ -703,8 +771,8 @@ impl RequestorInner {
                     None,
                     &src_saddr,
                     &dst_saddr,
-                    req_data.as_ptr() as *const _,
-                    req_data.len() as u16,
+                    req_ptr,
+                    req_len,
                     Some(&ip_option as *const _ as *const _),
                     buffer as *mut _,
                     buffer_len,
@@ -802,29 +870,28 @@ fn start_request(
     Ok(())
 }
 
-fn ip_error_to_icmp_status(code: u32) -> IcmpEchoStatus {
+fn ip_error_to_icmp_outcome(code: u32) -> IcmpOutcome {
     match code {
-        IP_SUCCESS => IcmpEchoStatus::Success,
-        IP_REQ_TIMED_OUT | IP_TIME_EXCEEDED | IP_TTL_EXPIRED_REASSEM | IP_TTL_EXPIRED_TRANSIT => {
-            IcmpEchoStatus::TimedOut
+        IP_SUCCESS => IcmpOutcome::EchoReply,
+        IP_REQ_TIMED_OUT => IcmpOutcome::LocalTimeout,
+        IP_TIME_EXCEEDED | IP_TTL_EXPIRED_REASSEM | IP_TTL_EXPIRED_TRANSIT => {
+            IcmpOutcome::TimeExceeded
         }
-        IP_DEST_HOST_UNREACHABLE
-        | IP_DEST_NET_UNREACHABLE
-        | IP_DEST_PORT_UNREACHABLE
-        | IP_DEST_PROT_UNREACHABLE
-        | IP_DEST_UNREACHABLE
-        // The IPv6 "no route" / "address unreachable" / "prohibited" codes share the
-        // values of IP_DEST_NET/HOST/PROT_UNREACHABLE above; scope mismatch is distinct.
-        | IP_DEST_SCOPE_MISMATCH => IcmpEchoStatus::Unreachable,
-        code if code == ERROR_NETWORK_UNREACHABLE.0
-            || code == ERROR_HOST_UNREACHABLE.0
-            || code == ERROR_PROTOCOL_UNREACHABLE.0
-            || code == ERROR_PORT_UNREACHABLE.0 =>
-        {
-            IcmpEchoStatus::Unreachable
-        }
-        _ => IcmpEchoStatus::Unknown,
+        IP_DEST_NET_UNREACHABLE => IcmpOutcome::NetworkUnreachable,
+        IP_DEST_HOST_UNREACHABLE => IcmpOutcome::HostUnreachable,
+        IP_DEST_PORT_UNREACHABLE => IcmpOutcome::PortUnreachable,
+        IP_DEST_PROT_UNREACHABLE => IcmpOutcome::ProtocolUnreachable,
+        IP_DEST_SCOPE_MISMATCH | IP_DEST_UNREACHABLE => IcmpOutcome::DestinationUnreachable,
+        code if code == ERROR_NETWORK_UNREACHABLE.0 => IcmpOutcome::NetworkUnreachable,
+        code if code == ERROR_HOST_UNREACHABLE.0 => IcmpOutcome::HostUnreachable,
+        code if code == ERROR_PROTOCOL_UNREACHABLE.0 => IcmpOutcome::ProtocolUnreachable,
+        code if code == ERROR_PORT_UNREACHABLE.0 => IcmpOutcome::PortUnreachable,
+        _ => IcmpOutcome::Other,
     }
+}
+
+fn ip_error_to_icmp_status(code: u32) -> IcmpEchoStatus {
+    ip_error_to_icmp_outcome(code).coarse()
 }
 
 /// Completion callback: publishes the result of a request that was still pending when
@@ -980,6 +1047,52 @@ mod tests {
     // ---- pure classification helpers -------------------------------------------------
 
     #[test]
+    fn responder_helpers_drop_unspecified_addresses() {
+        assert_eq!(responder_v4(0), None);
+        assert_eq!(
+            responder_v4(u32::from_be(0xc0000201)),
+            Some("192.0.2.1".parse().unwrap())
+        );
+        let mut unspecified = IN6_ADDR::default();
+        unspecified.u.Byte = [0; 16];
+        assert_eq!(responder_v6(unspecified), None);
+        let mut responder = IN6_ADDR::default();
+        responder.u.Byte = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        assert_eq!(
+            responder_v6(responder),
+            Some("2001:db8::1".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn payload_length_accepts_boundaries_and_rejects_out_of_range() {
+        for payload_len in [0, 1, 7, 8, 32, 56, 1024] {
+            let requestor = IcmpEchoRequestor::with_payload_len(
+                "127.0.0.1".parse().unwrap(),
+                None,
+                None,
+                None,
+                payload_len,
+            )
+            .unwrap();
+            assert_eq!(requestor.payload_len(), payload_len);
+        }
+        for payload_len in [PING_MAX_REQUEST_DATA_LENGTH + 1, usize::MAX] {
+            let result = IcmpEchoRequestor::with_payload_len(
+                "127.0.0.1".parse().unwrap(),
+                None,
+                None,
+                None,
+                payload_len,
+            );
+            assert_eq!(
+                result.as_ref().err().map(io::Error::kind),
+                Some(io::ErrorKind::InvalidInput)
+            );
+        }
+    }
+
+    #[test]
     fn classify_send_result_table() {
         assert_eq!(classify_send_result(1, 0), SendOutcome::Completed);
         assert_eq!(classify_send_result(1, 12345), SendOutcome::Completed);
@@ -1031,9 +1144,18 @@ mod tests {
             IP_PARAM_PROBLEM,
         };
         assert_eq!(ip_error_to_icmp_status(IP_SUCCESS), IcmpEchoStatus::Success);
+        assert_eq!(ip_error_to_icmp_outcome(IP_SUCCESS), IcmpOutcome::EchoReply);
         assert_eq!(
             ip_error_to_icmp_status(IP_REQ_TIMED_OUT),
             IcmpEchoStatus::TimedOut
+        );
+        assert_eq!(
+            ip_error_to_icmp_outcome(IP_TIME_EXCEEDED),
+            IcmpOutcome::TimeExceeded
+        );
+        assert_eq!(
+            ip_error_to_icmp_status(IP_TIME_EXCEEDED),
+            IcmpEchoStatus::Unreachable
         );
         for code in [
             IP_DEST_HOST_UNREACHABLE,
@@ -1075,11 +1197,13 @@ mod tests {
         // Echo outcomes the driver reports immediately are replies.
         let reply = immediate_failure_result(IP_REQ_TIMED_OUT, target, timeout).unwrap();
         assert_eq!(reply.status(), IcmpEchoStatus::TimedOut);
+        assert_eq!(reply.outcome(), IcmpOutcome::LocalTimeout);
         assert_eq!(reply.round_trip_time(), timeout);
         assert_eq!(reply.destination(), target);
         assert!(stamped_now(&reply));
         let reply = immediate_failure_result(IP_DEST_HOST_UNREACHABLE, target, timeout).unwrap();
         assert_eq!(reply.status(), IcmpEchoStatus::Unreachable);
+        assert_eq!(reply.outcome(), IcmpOutcome::HostUnreachable);
         assert_eq!(reply.round_trip_time(), Duration::ZERO);
         assert!(stamped_now(&reply));
         let reply = immediate_failure_result(ERROR_HOST_UNREACHABLE.0, target, timeout).unwrap();

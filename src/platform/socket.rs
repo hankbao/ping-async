@@ -8,7 +8,7 @@ use std::mem::MaybeUninit;
 use std::net::{IpAddr, SocketAddr};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -20,7 +20,9 @@ use tokio::time::{self, Instant};
 
 use crate::{
     icmp::{IcmpErrorInfo, IcmpPacket},
-    IcmpEchoReply, IcmpEchoStatus, PING_DEFAULT_TIMEOUT, PING_DEFAULT_TTL,
+    IcmpEchoReply, IcmpEchoStatus, IcmpOutcome, PING_DEFAULT_REQUEST_DATA_LENGTH,
+    PING_DEFAULT_TIMEOUT, PING_DEFAULT_TTL, PING_MAX_REQUEST_DATA_LENGTH,
+    PING_MIN_REQUEST_DATA_LENGTH,
 };
 
 /// Receive buffer requested for the ICMP socket. On macOS every ICMP `SOCK_DGRAM` socket
@@ -28,19 +30,50 @@ use crate::{
 /// bursts, dropping the socket's own replies.
 const RECV_BUFFER_SIZE: usize = 1 << 20;
 
+struct SequenceSpace {
+    next: AtomicU32,
+}
+
+impl SequenceSpace {
+    fn new(start: u32) -> Self {
+        Self {
+            next: AtomicU32::new(start),
+        }
+    }
+
+    fn allocate(&self) -> io::Result<u16> {
+        self.next
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                (value <= u32::from(u16::MAX)).then_some(value + 1)
+            })
+            .map(|value| value as u16)
+            .map_err(|_| io::Error::other("ICMP sequence space is exhausted"))
+    }
+}
+
+static SHORT_SEQUENCE_SPACE: OnceLock<SequenceSpace> = OnceLock::new();
+
+fn allocate_short_sequence() -> io::Result<u16> {
+    static RANDOM_START: OnceLock<u16> = OnceLock::new();
+    SHORT_SEQUENCE_SPACE
+        .get_or_init(|| SequenceSpace::new(u32::from(*RANDOM_START.get_or_init(rand::random))))
+        .allocate()
+}
+
 /// One in-flight request registered under its ICMP sequence number.
 struct RegistryEntry {
     /// Unique per request for the lifetime of the requestor; lets a guard tell its own
-    /// entry apart from a newer request that reused the same sequence number.
+    /// entry apart from any replacement under the same key.
     request_id: u64,
-    /// Timestamp carried in the echo request payload; a reply must echo it back.
     sent_timestamp: u64,
+    sent_payload: Vec<u8>,
+    payload_len: usize,
     tx: oneshot::Sender<IcmpEchoReply>,
 }
 
 /// Registry of in-flight requests plus the allocation state for sequence numbers.
 struct Registry {
-    next_sequence: u16,
+    next_sequence: Option<u16>,
     next_request_id: u64,
     entries: HashMap<u16, RegistryEntry>,
 }
@@ -48,7 +81,7 @@ struct Registry {
 impl Registry {
     fn new() -> Self {
         Registry {
-            next_sequence: 0,
+            next_sequence: Some(0),
             next_request_id: 1,
             entries: HashMap::new(),
         }
@@ -57,33 +90,55 @@ impl Registry {
     /// Allocates a sequence number that is not currently in flight and registers the
     /// request under it. Returns the sequence number and the request's unique id.
     ///
-    /// Walks the 16-bit space from `next_sequence` until a vacant value is found; fails only
-    /// if all 65 536 values are in flight (in which case no id is consumed).
+    /// Long-payload sequence numbers are monotonic for the lifetime of the requestor and
+    /// are never reused. Short-payload sequence numbers come from a process-wide
+    /// non-reusing space. Both policies are required because ICMP errors do not echo the
+    /// request payload.
     fn allocate(
         &mut self,
         sent_timestamp: u64,
+        payload_len: usize,
         tx: oneshot::Sender<IcmpEchoReply>,
     ) -> io::Result<(u16, u64)> {
-        let mut candidate = self.next_sequence;
+        let mut candidate = if payload_len < 8 {
+            allocate_short_sequence()?
+        } else {
+            self.next_sequence
+                .ok_or_else(|| io::Error::other("ICMP sequence space is exhausted"))?
+        };
         for _ in 0..=usize::from(u16::MAX) {
             match self.entries.entry(candidate) {
                 Entry::Vacant(vacant) => {
                     let request_id = self.next_request_id;
                     self.next_request_id += 1;
+                    let mut sent_payload = vec![0u8; payload_len];
+                    if payload_len >= 8 {
+                        sent_payload[..8].copy_from_slice(&sent_timestamp.to_be_bytes());
+                    }
                     vacant.insert(RegistryEntry {
                         request_id,
                         sent_timestamp,
+                        sent_payload,
+                        payload_len,
                         tx,
                     });
-                    self.next_sequence = candidate.wrapping_add(1);
+                    if payload_len >= 8 {
+                        self.next_sequence = candidate.checked_add(1);
+                    }
                     return Ok((candidate, request_id));
                 }
-                Entry::Occupied(_) => candidate = candidate.wrapping_add(1),
+                Entry::Occupied(_) if payload_len >= 8 => {
+                    self.next_sequence = candidate.checked_add(1);
+                    candidate = self
+                        .next_sequence
+                        .ok_or_else(|| io::Error::other("ICMP sequence space is exhausted"))?;
+                }
+                Entry::Occupied(_) => {
+                    candidate = candidate.wrapping_add(1);
+                }
             }
         }
-        Err(io::Error::other(
-            "all 65536 ICMP sequence numbers are in flight",
-        ))
+        Err(io::Error::other("ICMP sequence space is exhausted"))
     }
 
     /// Removes the entry for `sequence` only if it still belongs to `request_id`.
@@ -203,15 +258,19 @@ async fn run_request(
     send_stage: impl Future<Output = io::Result<()>>,
     reply_rx: oneshot::Receiver<IcmpEchoReply>,
     target_addr: IpAddr,
+    sequence: u16,
     started_at: Instant,
 ) -> Result<IcmpEchoReply, RequestFailure> {
     // Invoked at the moment a deadline is observed to have passed; the completion instant
     // is taken before the elapsed time is read so that it records that observation.
     let timed_out = || {
         let completed_at = std::time::Instant::now();
-        IcmpEchoReply::with_completed_at(
+        IcmpEchoReply::with_evidence(
             target_addr,
             IcmpEchoStatus::TimedOut,
+            IcmpOutcome::LocalTimeout,
+            None,
+            Some(sequence),
             started_at.elapsed(),
             completed_at,
         )
@@ -225,10 +284,17 @@ async fn run_request(
                 | io::ErrorKind::NetworkDown
                 | io::ErrorKind::HostUnreachable => {
                     // The send failure has been classified as an echo outcome.
+                    let outcome = match e.kind() {
+                        io::ErrorKind::HostUnreachable => IcmpOutcome::HostUnreachable,
+                        _ => IcmpOutcome::NetworkUnreachable,
+                    };
                     let completed_at = std::time::Instant::now();
-                    Ok(IcmpEchoReply::with_completed_at(
+                    Ok(IcmpEchoReply::with_evidence(
                         target_addr,
-                        IcmpEchoStatus::Unreachable,
+                        outcome.coarse(),
+                        outcome,
+                        None,
+                        Some(sequence),
                         Duration::ZERO,
                         completed_at,
                     ))
@@ -289,6 +355,7 @@ struct RequestorInner {
     target_addr: IpAddr,
     timeout: Duration,
     identifier: u16,
+    payload_len: usize,
     registry: SharedRegistry,
     router_abort: OnceLock<tokio::task::AbortHandle>,
     router_context: RouterContext,
@@ -347,6 +414,32 @@ impl IcmpEchoRequestor {
         ttl: Option<u8>,
         timeout: Option<Duration>,
     ) -> io::Result<Self> {
+        Self::with_payload_len(
+            target_addr,
+            source_addr,
+            ttl,
+            timeout,
+            PING_DEFAULT_REQUEST_DATA_LENGTH,
+        )
+    }
+
+    /// Creates a requestor that transmits exactly `payload_len` payload bytes.
+    pub fn with_payload_len(
+        target_addr: IpAddr,
+        source_addr: Option<IpAddr>,
+        ttl: Option<u8>,
+        timeout: Option<Duration>,
+        payload_len: usize,
+    ) -> io::Result<Self> {
+        if !(PING_MIN_REQUEST_DATA_LENGTH..=PING_MAX_REQUEST_DATA_LENGTH).contains(&payload_len) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "payload_len {payload_len} is outside {PING_MIN_REQUEST_DATA_LENGTH}..={PING_MAX_REQUEST_DATA_LENGTH}"
+                ),
+            ));
+        }
+
         // Check if the target address matches the source address type
         match (target_addr, source_addr) {
             (IpAddr::V4(_), Some(IpAddr::V6(_))) | (IpAddr::V6(_), Some(IpAddr::V4(_))) => {
@@ -380,11 +473,17 @@ impl IcmpEchoRequestor {
                 target_addr,
                 timeout,
                 identifier,
+                payload_len,
                 registry,
                 router_abort: OnceLock::new(),
                 router_context,
             }),
         })
+    }
+
+    /// Returns the exact payload length used on the wire.
+    pub fn payload_len(&self) -> usize {
+        self.inner.payload_len
     }
 
     /// Sends an ICMP echo request and waits for a reply.
@@ -424,10 +523,10 @@ impl IcmpEchoRequestor {
     /// # Platform Notes
     ///
     /// On Linux, ICMP Destination Unreachable / Time Exceeded messages are received through
-    /// the socket error queue (`IP_RECVERR` / `IPV6_RECVERR`) and reported as
-    /// `Unreachable` / `TimedOut` before the local timeout, like on macOS. The other ICMP
-    /// errors that embed the request (Parameter Problem, ICMPv6 Packet Too Big) resolve it
-    /// as `Unknown`, as on Windows.
+    /// the socket error queue (`IP_RECVERR` / `IPV6_RECVERR`) before the local timeout.
+    /// Their coarse status is `Unreachable`; `IcmpOutcome` retains the network subtype and
+    /// distinguishes Time Exceeded from a local deadline. The other ICMP errors that embed
+    /// the request (Parameter Problem, ICMPv6 Packet Too Big) resolve as `Unknown`.
     ///
     /// # Examples
     ///
@@ -469,12 +568,15 @@ impl IcmpEchoRequestor {
         let started_at = Instant::now();
         let deadline = started_at + self.inner.timeout;
 
-        // Use timestamp as our payload
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|e| io::Error::other(format!("timestamp error: {e}")))?
             .as_nanos() as u64;
-        let payload = timestamp.to_be_bytes();
+        let payload_len = self.inner.payload_len;
+        let mut payload = vec![0u8; payload_len];
+        if payload_len >= 8 {
+            payload[..8].copy_from_slice(&timestamp.to_be_bytes());
+        }
 
         // Register in the registry BEFORE sending so fast replies (e.g. loopback)
         // are not dropped by the router due to a missing entry. Registration fails fast
@@ -482,7 +584,7 @@ impl IcmpEchoRequestor {
         // allocation are one critical section, see `register_request`). The guard removes
         // the entry on every exit path, including the future being dropped.
         let (tx, reply_rx) = oneshot::channel();
-        let (sequence, request_id) = self.inner.register_request(timestamp, tx)?;
+        let (sequence, request_id) = self.inner.register_request(timestamp, payload_len, tx)?;
         let _guard = RegistryGuard {
             registry: Arc::clone(&self.inner.registry),
             sequence,
@@ -503,6 +605,7 @@ impl IcmpEchoRequestor {
             send_stage,
             reply_rx,
             self.inner.target_addr,
+            sequence,
             started_at,
         )
         .await
@@ -558,7 +661,13 @@ impl IcmpEchoRequestor {
                 drained
             };
             for info in &drained.infos {
-                deliver_error(&ctx.registry, self.inner.identifier, ctx.target_addr, info);
+                deliver_error(
+                    &ctx.registry,
+                    self.inner.identifier,
+                    ctx.target_addr,
+                    info,
+                    None,
+                );
             }
             if ctx.errqueue_drained.load(Ordering::SeqCst) == removed_before {
                 // Nothing was queued: the errno is this destination's own.
@@ -600,13 +709,14 @@ impl RequestorInner {
     fn register_request(
         &self,
         sent_timestamp: u64,
+        payload_len: usize,
         tx: oneshot::Sender<IcmpEchoReply>,
     ) -> io::Result<(u16, u64)> {
         let mut registry = lock_registry(&self.registry);
         if let Some(ref router_error) = *lock_failure(&self.router_context.failed) {
             return Err(router_error.to_io_error());
         }
-        registry.allocate(sent_timestamp, tx)
+        registry.allocate(sent_timestamp, payload_len, tx)
     }
 }
 
@@ -628,29 +738,31 @@ fn deliver_echo_reply(
     registry: &SharedRegistry,
     identifier: u16,
     target_addr: IpAddr,
+    responder: Option<IpAddr>,
     packet: &IcmpPacket,
 ) -> bool {
+    let responder =
+        responder.filter(|addr| !addr.is_unspecified() && addr.is_ipv4() == target_addr.is_ipv4());
     if packet.identifier() != identifier {
         return false;
     }
     let payload = packet.payload();
-    if payload.len() < 8 {
-        return false;
-    }
-    let sent_timestamp = u64::from_be_bytes([
-        payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6],
-        payload[7],
-    ]);
 
     let entry = {
         let mut registry = lock_registry(registry);
         match registry.entries.entry(packet.sequence()) {
-            Entry::Occupied(occupied) if occupied.get().sent_timestamp == sent_timestamp => {
+            Entry::Occupied(occupied) => {
+                let entry = occupied.get();
+                if payload.len() != entry.payload_len || payload != entry.sent_payload {
+                    return false;
+                }
                 occupied.remove()
             }
-            _ => return false,
+            Entry::Vacant(_) => return false,
         }
     };
+
+    let sent_timestamp = entry.sent_timestamp;
 
     // The reply has been matched to a live request: the outcome is decided.
     let completed_at = std::time::Instant::now();
@@ -659,9 +771,12 @@ fn deliver_echo_reply(
         .unwrap_or_default()
         .as_nanos() as u64;
     let rtt = Duration::from_nanos(now.saturating_sub(sent_timestamp));
-    let _ = entry.tx.send(IcmpEchoReply::with_completed_at(
+    let _ = entry.tx.send(IcmpEchoReply::with_evidence(
         target_addr,
         IcmpEchoStatus::Success,
+        IcmpOutcome::EchoReply,
+        responder,
+        Some(packet.sequence()),
         rtt,
         completed_at,
     ));
@@ -677,7 +792,12 @@ fn deliver_error(
     identifier: u16,
     target_addr: IpAddr,
     info: &IcmpErrorInfo,
+    fallback_responder: Option<IpAddr>,
 ) -> bool {
+    let responder = info
+        .responder
+        .or(fallback_responder)
+        .filter(|addr| !addr.is_unspecified() && addr.is_ipv4() == target_addr.is_ipv4());
     if info.identifier != identifier {
         return false;
     }
@@ -686,9 +806,12 @@ fn deliver_error(
         Some(entry) => {
             // The error has been matched to a live request; its status is known.
             let completed_at = std::time::Instant::now();
-            let _ = entry.tx.send(IcmpEchoReply::with_completed_at(
+            let _ = entry.tx.send(IcmpEchoReply::with_evidence(
                 target_addr,
                 info.status,
+                info.outcome,
+                responder,
+                Some(info.sequence),
                 Duration::ZERO,
                 completed_at,
             ));
@@ -745,7 +868,7 @@ enum WakeAction {
     DrainAndClassify,
 }
 
-fn wake_action(wake: &io::Result<usize>) -> WakeAction {
+fn wake_action(wake: &io::Result<(usize, Option<SocketAddr>)>) -> WakeAction {
     match wake {
         Ok(_) => WakeAction::Datagram,
         Err(e) if e.kind() == io::ErrorKind::WouldBlock => WakeAction::DrainAndContinue,
@@ -807,19 +930,23 @@ fn router_action(
 /// (production: `errqueue::drain`, a no-op on macOS).
 fn handle_wake(
     state: &mut RouterState,
-    wake: io::Result<usize>,
+    wake: io::Result<(usize, Option<SocketAddr>)>,
     buf: &[u8],
     drain: &mut dyn FnMut() -> Drained,
 ) -> RouterStep {
     let action = wake_action(&wake);
 
-    if let (WakeAction::Datagram, Ok(size)) = (action, &wake) {
+    if let (WakeAction::Datagram, Ok((size, from))) = (action, &wake) {
         let data = &buf[..*size];
+        let responder = from
+            .map(|addr| addr.ip())
+            .filter(|addr| !addr.is_unspecified() && addr.is_ipv4() == state.target_addr.is_ipv4());
         if let Some(reply_packet) = IcmpPacket::parse_reply(data, state.target_addr) {
             deliver_echo_reply(
                 &state.registry,
                 state.identifier,
                 state.target_addr,
+                responder,
                 &reply_packet,
             );
         } else if let Some(error_info) = IcmpPacket::parse_error_reply(data, state.target_addr) {
@@ -828,6 +955,7 @@ fn handle_wake(
                 state.identifier,
                 state.target_addr,
                 &error_info,
+                responder,
             );
         }
         state.last_gen = state.errqueue_drained.load(Ordering::SeqCst);
@@ -862,7 +990,13 @@ fn handle_wake(
     };
 
     for info in &infos {
-        deliver_error(&state.registry, state.identifier, state.target_addr, info);
+        deliver_error(
+            &state.registry,
+            state.identifier,
+            state.target_addr,
+            info,
+            None,
+        );
     }
 
     match (router_action, wake) {
@@ -886,9 +1020,9 @@ fn try_receive(
     socket: &UdpSocket,
     scratch: &mut [MaybeUninit<u8>],
     buf: &mut [u8],
-) -> io::Result<usize> {
-    let received = match socket.try_io(Interest::READABLE, || {
-        socket2::SockRef::from(socket).recv(scratch)
+) -> io::Result<(usize, Option<SocketAddr>)> {
+    let (received, from) = match socket.try_io(Interest::READABLE, || {
+        socket2::SockRef::from(socket).recv_from(scratch)
     }) {
         Ok(received) => received,
         Err(e) => {
@@ -901,16 +1035,16 @@ fn try_receive(
         }
     };
     let received = received.min(buf.len());
-    // SAFETY: `recv` initialised the first `received` bytes of `scratch`.
+    // SAFETY: `recv_from` initialised the first `received` bytes of `scratch`.
     let initialised =
         unsafe { std::slice::from_raw_parts(scratch.as_ptr().cast::<u8>(), received) };
     buf[..received].copy_from_slice(initialised);
-    Ok(received)
+    Ok((received, from.as_socket()))
 }
 
 async fn reply_router_loop(socket: Arc<UdpSocket>, mut state: RouterState) {
-    let mut scratch: Vec<MaybeUninit<u8>> = vec![MaybeUninit::uninit(); 1024];
-    let mut buf = vec![0u8; 1024];
+    let mut scratch: Vec<MaybeUninit<u8>> = vec![MaybeUninit::uninit(); 2048];
+    let mut buf = vec![0u8; 2048];
 
     #[cfg(target_os = "linux")]
     let mut drain = {
@@ -944,7 +1078,7 @@ async fn reply_router_loop(socket: Arc<UdpSocket>, mut state: RouterState) {
 mod errqueue {
     use std::io;
     use std::mem;
-    use std::net::IpAddr;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
     use std::os::fd::{AsRawFd, RawFd};
     use std::ptr;
 
@@ -978,13 +1112,67 @@ mod errqueue {
         }
     }
 
-    /// Interprets one error-queue message: `origin` / `ee_type` from the
-    /// `sock_extended_err` control message, `data` = the message payload (the embedded
-    /// echo request starting at its ICMP header). Only ICMP-originated Destination
-    /// Unreachable / Time Exceeded messages for our address family are reported.
+    fn parse_offender(cmsg: *mut libc::cmsghdr, target_addr: IpAddr) -> Option<IpAddr> {
+        // SAFETY: `cmsg` points to the control-buffer header being iterated.
+        let header: libc::cmsghdr = unsafe { ptr::read_unaligned(cmsg) };
+        let data_len = header
+            .cmsg_len
+            .checked_sub(mem::size_of::<libc::cmsghdr>())?;
+        let ee_len = mem::size_of::<libc::sock_extended_err>();
+        if data_len < ee_len + mem::size_of::<libc::sockaddr>() {
+            return None;
+        }
+        // SAFETY: the preceding length check covers the extended-error structure.
+        let offender = unsafe {
+            libc::CMSG_DATA(cmsg)
+                .cast::<u8>()
+                .add(ee_len)
+                .cast::<libc::sockaddr>()
+        };
+        // SAFETY: the control message contains a sockaddr after the extended-error data.
+        let family = unsafe { ptr::read_unaligned(offender) }.sa_family as libc::c_int;
+        match target_addr {
+            IpAddr::V4(_) if family == libc::AF_INET => {
+                if data_len < ee_len + mem::size_of::<libc::sockaddr_in>() {
+                    return None;
+                }
+                // SAFETY: the address-family-specific structure is present in the cmsg.
+                let address = unsafe { ptr::read_unaligned(offender.cast::<libc::sockaddr_in>()) };
+                Some(IpAddr::V4(Ipv4Addr::from(u32::from_be(
+                    address.sin_addr.s_addr,
+                ))))
+            }
+            IpAddr::V6(_) if family == libc::AF_INET6 => {
+                if data_len < ee_len + mem::size_of::<libc::sockaddr_in6>() {
+                    return None;
+                }
+                // SAFETY: the address-family-specific structure is present in the cmsg.
+                let address = unsafe { ptr::read_unaligned(offender.cast::<libc::sockaddr_in6>()) };
+                Some(IpAddr::V6(Ipv6Addr::from(address.sin6_addr.s6_addr)))
+            }
+            _ => None,
+        }
+    }
+
+    /// Interprets one error-queue message: `origin` / `ee_type` / `ee_code` from the
+    /// `sock_extended_err` control message, `responder` from its offender address, and
+    /// `data` = the message payload (the embedded echo request starting at its ICMP
+    /// header). Only ICMP-originated errors for our address family are reported.
+    #[cfg(test)]
     pub(super) fn parse_extended_error(
         origin: u8,
         ee_type: u8,
+        data: &[u8],
+        target_addr: IpAddr,
+    ) -> Option<IcmpErrorInfo> {
+        parse_extended_error_with_code(origin, ee_type, 0, None, data, target_addr)
+    }
+
+    pub(super) fn parse_extended_error_with_code(
+        origin: u8,
+        ee_type: u8,
+        ee_code: u8,
+        responder: Option<IpAddr>,
         data: &[u8],
         target_addr: IpAddr,
     ) -> Option<IcmpErrorInfo> {
@@ -996,12 +1184,14 @@ mod errqueue {
         if origin != expected_origin {
             return None;
         }
-        let status = IcmpPacket::error_status(target_addr, ee_type)?;
+        let outcome = IcmpPacket::error_outcome(target_addr, ee_type, ee_code)?;
         let (identifier, sequence) = IcmpPacket::parse_embedded_echo_request(data, target_addr)?;
         Some(IcmpErrorInfo {
             identifier,
             sequence,
-            status,
+            status: outcome.coarse(),
+            outcome,
+            responder,
         })
     }
 
@@ -1048,9 +1238,11 @@ mod errqueue {
             if is_recverr {
                 let ee: libc::sock_extended_err =
                     unsafe { ptr::read_unaligned(libc::CMSG_DATA(cmsg) as *const _) };
-                return Ok(Some(parse_extended_error(
+                return Ok(Some(parse_extended_error_with_code(
                     ee.ee_origin,
                     ee.ee_type,
+                    ee.ee_code,
+                    parse_offender(cmsg, target_addr),
                     &data[..received],
                     target_addr,
                 )));
@@ -1211,7 +1403,7 @@ mod tests {
 
     fn register(state: &RouterState, ts: u64) -> (u16, oneshot::Receiver<IcmpEchoReply>) {
         let (tx, rx) = oneshot::channel();
-        let (seq, _) = lock_registry(&state.registry).allocate(ts, tx).unwrap();
+        let (seq, _) = lock_registry(&state.registry).allocate(ts, 8, tx).unwrap();
         (seq, rx)
     }
 
@@ -1219,7 +1411,7 @@ mod tests {
         Drained::default()
     }
 
-    fn err(kind: io::ErrorKind) -> io::Result<usize> {
+    fn err(kind: io::ErrorKind) -> io::Result<(usize, Option<SocketAddr>)> {
         Err(io::Error::from(kind))
     }
 
@@ -1269,10 +1461,35 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn short_sequence_space_exhausts_without_wrapping() {
+        let space = SequenceSpace::new(u32::from(u16::MAX));
+        assert_eq!(space.allocate().unwrap(), u16::MAX);
+        assert!(space.allocate().is_err());
+    }
+
+    #[tokio::test]
+    async fn payload_length_accepts_boundaries_and_rejects_out_of_range() {
+        for payload_len in [0, 1, 7, 8, 32, 56, 1024] {
+            let requestor =
+                IcmpEchoRequestor::with_payload_len(target(), None, None, None, payload_len)
+                    .unwrap();
+            assert_eq!(requestor.payload_len(), payload_len);
+        }
+        for payload_len in [PING_MAX_REQUEST_DATA_LENGTH + 1, usize::MAX] {
+            let result =
+                IcmpEchoRequestor::with_payload_len(target(), None, None, None, payload_len);
+            assert_eq!(
+                result.as_ref().err().map(io::Error::kind),
+                Some(io::ErrorKind::InvalidInput)
+            );
+        }
+    }
+
     // ---- registry allocation ---------------------------------------------------------
 
     #[test]
-    fn allocate_skips_occupied_and_wraps() {
+    fn allocate_skips_occupied_and_exhausts_without_wrapping() {
         let mut registry = Registry::new();
         for seq in 0..=2u16 {
             registry.entries.insert(
@@ -1280,26 +1497,29 @@ mod tests {
                 RegistryEntry {
                     request_id: 0,
                     sent_timestamp: 0,
+                    sent_payload: vec![0u8; 8],
+                    payload_len: 8,
                     tx: dummy_sender(),
                 },
             );
         }
-        let (seq, _) = registry.allocate(1, dummy_sender()).unwrap();
+        let (seq, _) = registry.allocate(1, 8, dummy_sender()).unwrap();
         assert_eq!(seq, 3);
 
         let mut registry = Registry::new();
-        registry.next_sequence = u16::MAX;
+        registry.next_sequence = Some(u16::MAX);
         registry.entries.insert(
             u16::MAX,
             RegistryEntry {
                 request_id: 0,
                 sent_timestamp: 0,
+                sent_payload: vec![0u8; 8],
+                payload_len: 8,
                 tx: dummy_sender(),
             },
         );
-        let (seq, _) = registry.allocate(1, dummy_sender()).unwrap();
-        assert_eq!(seq, 0, "walk wraps from u16::MAX to 0");
-        assert_eq!(registry.next_sequence, 1);
+        assert!(registry.allocate(1, 8, dummy_sender()).is_err());
+        assert_eq!(registry.next_sequence, None);
     }
 
     #[test]
@@ -1307,13 +1527,13 @@ mod tests {
         let mut registry = Registry::new();
         let mut last_id = 0;
         for _ in 0..=usize::from(u16::MAX) {
-            let (_, id) = registry.allocate(0, dummy_sender()).unwrap();
+            let (_, id) = registry.allocate(0, 8, dummy_sender()).unwrap();
             assert!(id > last_id, "ids are strictly increasing");
             last_id = id;
         }
         assert_eq!(registry.entries.len(), 65_536);
         let next_id_before = registry.next_request_id;
-        assert!(registry.allocate(0, dummy_sender()).is_err());
+        assert!(registry.allocate(0, 8, dummy_sender()).is_err());
         assert_eq!(registry.next_request_id, next_id_before);
     }
 
@@ -1322,7 +1542,7 @@ mod tests {
         let registry: SharedRegistry = Arc::new(Mutex::new(Registry::new()));
 
         let (seq, id1) = lock_registry(&registry)
-            .allocate(1, dummy_sender())
+            .allocate(1, 8, dummy_sender())
             .unwrap();
         let guard1 = RegistryGuard {
             registry: Arc::clone(&registry),
@@ -1334,9 +1554,9 @@ mod tests {
         lock_registry(&registry).entries.remove(&seq);
 
         // Force the next allocation to reuse the same sequence number.
-        lock_registry(&registry).next_sequence = seq;
+        lock_registry(&registry).next_sequence = Some(seq);
         let (seq2, id2) = lock_registry(&registry)
-            .allocate(2, dummy_sender())
+            .allocate(2, 8, dummy_sender())
             .unwrap();
         assert_eq!(seq2, seq);
         assert_ne!(id2, id1);
@@ -1356,6 +1576,62 @@ mod tests {
 
         drop(guard2);
         assert!(lock_registry(&registry).entries.is_empty());
+    }
+
+    #[test]
+    fn stale_icmp_error_cannot_satisfy_a_later_long_request() {
+        let target = target();
+        let registry: SharedRegistry = Arc::new(Mutex::new(Registry::new()));
+        let (tx, _rx) = oneshot::channel();
+        let (old_sequence, _) = lock_registry(&registry).allocate(1, 8, tx).unwrap();
+        lock_registry(&registry).entries.remove(&old_sequence);
+        let (tx, mut rx) = oneshot::channel();
+        let (new_sequence, _) = lock_registry(&registry).allocate(2, 8, tx).unwrap();
+        assert_ne!(old_sequence, new_sequence);
+        let old_error = IcmpErrorInfo {
+            identifier: TEST_IDENTIFIER,
+            sequence: old_sequence,
+            status: IcmpEchoStatus::Unreachable,
+            outcome: IcmpOutcome::TimeExceeded,
+            responder: None,
+        };
+        assert!(!deliver_error(
+            &registry,
+            TEST_IDENTIFIER,
+            target,
+            &old_error,
+            None,
+        ));
+        assert!(lock_registry(&registry).entries.contains_key(&new_sequence));
+        assert!(rx.try_recv().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn concurrent_short_payloads_use_distinct_sequences() -> io::Result<()> {
+        let pinger = IcmpEchoRequestor::with_payload_len(
+            "127.0.0.1".parse().unwrap(),
+            None,
+            None,
+            Some(Duration::from_secs(1)),
+            0,
+        )?;
+        let replies = futures::future::join_all((0..8).map(|_| pinger.send()))
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut sequences = replies
+            .iter()
+            .map(|reply| reply.sequence().expect("Unix sequence"))
+            .collect::<Vec<_>>();
+        sequences.sort_unstable();
+        sequences.dedup();
+        assert_eq!(sequences.len(), replies.len());
+        assert!(replies.iter().all(|reply| {
+            reply.status() == IcmpEchoStatus::Success
+                && reply.outcome() == IcmpOutcome::EchoReply
+                && reply.responder() == Some("127.0.0.1".parse().unwrap())
+        }));
+        Ok(())
     }
 
     #[tokio::test]
@@ -1402,10 +1678,12 @@ mod tests {
         let identifier = TEST_IDENTIFIER;
         let registry: SharedRegistry = Arc::new(Mutex::new(Registry::new()));
         let (tx, mut rx) = oneshot::channel();
-        let (seq, _) = lock_registry(&registry).allocate(2, tx).unwrap();
+        let (seq, _) = lock_registry(&registry).allocate(2, 8, tx).unwrap();
 
         let stale = echo_reply_packet(target, identifier, seq, 1);
-        assert!(!deliver_echo_reply(&registry, identifier, target, &stale));
+        assert!(!deliver_echo_reply(
+            &registry, identifier, target, None, &stale
+        ));
         assert!(lock_registry(&registry).entries.contains_key(&seq));
         assert!(
             rx.try_recv().unwrap().is_none(),
@@ -1414,7 +1692,9 @@ mod tests {
 
         let fresh = echo_reply_packet(target, identifier, seq, 2);
         let before = std::time::Instant::now();
-        assert!(deliver_echo_reply(&registry, identifier, target, &fresh));
+        assert!(deliver_echo_reply(
+            &registry, identifier, target, None, &fresh
+        ));
         let after = std::time::Instant::now();
         assert!(!lock_registry(&registry).entries.contains_key(&seq));
         let reply = rx.try_recv().unwrap().expect("exactly one delivery");
@@ -1425,14 +1705,80 @@ mod tests {
         );
 
         let again = echo_reply_packet(target, identifier, seq, 2);
-        assert!(!deliver_echo_reply(&registry, identifier, target, &again));
+        assert!(!deliver_echo_reply(
+            &registry, identifier, target, None, &again
+        ));
 
         // Wrong identifier is ignored even with a matching entry.
         let (tx, _rx) = oneshot::channel();
-        let (seq, _) = lock_registry(&registry).allocate(3, tx).unwrap();
+        let (seq, _) = lock_registry(&registry).allocate(3, 8, tx).unwrap();
         let other = echo_reply_packet(target, identifier.wrapping_add(1), seq, 3);
-        assert!(!deliver_echo_reply(&registry, identifier, target, &other));
+        assert!(!deliver_echo_reply(
+            &registry, identifier, target, None, &other
+        ));
         assert!(lock_registry(&registry).entries.contains_key(&seq));
+    }
+
+    #[test]
+    fn short_payload_replies_match_without_a_timestamp() {
+        for (target, responder) in [
+            (target(), "127.0.0.2".parse::<IpAddr>().unwrap()),
+            (
+                "::1".parse::<IpAddr>().unwrap(),
+                "::2".parse::<IpAddr>().unwrap(),
+            ),
+        ] {
+            let registry: SharedRegistry = Arc::new(Mutex::new(Registry::new()));
+            let (tx, mut rx) = oneshot::channel();
+            let (seq, _) = lock_registry(&registry).allocate(1, 0, tx).unwrap();
+            let packet = IcmpPacket::new(
+                IcmpType::echo_reply_for(target),
+                0,
+                TEST_IDENTIFIER,
+                seq,
+                &[],
+            );
+
+            assert!(deliver_echo_reply(
+                &registry,
+                TEST_IDENTIFIER,
+                target,
+                Some(responder),
+                &packet,
+            ));
+            let reply = rx.try_recv().unwrap().expect("short request delivered");
+            assert_eq!(reply.status(), IcmpEchoStatus::Success);
+            assert_eq!(reply.outcome(), IcmpOutcome::EchoReply);
+            assert_eq!(reply.responder(), Some(responder));
+            assert_eq!(reply.sequence(), Some(seq));
+        }
+    }
+
+    #[test]
+    fn short_payload_stale_reply_cannot_satisfy_a_later_request() {
+        let target = target();
+        let registry: SharedRegistry = Arc::new(Mutex::new(Registry::new()));
+        let (tx, _rx) = oneshot::channel();
+        let (old_sequence, _) = lock_registry(&registry).allocate(1, 0, tx).unwrap();
+        lock_registry(&registry).entries.remove(&old_sequence);
+        let (tx, _rx) = oneshot::channel();
+        let (new_sequence, _) = lock_registry(&registry).allocate(2, 0, tx).unwrap();
+        assert_ne!(old_sequence, new_sequence);
+        let old_reply = IcmpPacket::new(
+            IcmpType::echo_reply_for(target),
+            0,
+            TEST_IDENTIFIER,
+            old_sequence,
+            &[],
+        );
+        assert!(!deliver_echo_reply(
+            &registry,
+            TEST_IDENTIFIER,
+            target,
+            None,
+            &old_reply,
+        ));
+        assert!(lock_registry(&registry).entries.contains_key(&new_sequence));
     }
 
     // ---- end-to-end deadline ---------------------------------------------------------
@@ -1441,7 +1787,7 @@ mod tests {
     async fn run_request_pending_send_stage_times_out() {
         let registry: SharedRegistry = Arc::new(Mutex::new(Registry::new()));
         let (tx, rx) = oneshot::channel();
-        let (seq, id) = lock_registry(&registry).allocate(0, tx).unwrap();
+        let (seq, id) = lock_registry(&registry).allocate(0, 8, tx).unwrap();
         let guard = RegistryGuard {
             registry: Arc::clone(&registry),
             sequence: seq,
@@ -1450,9 +1796,19 @@ mod tests {
 
         let started = Instant::now();
         let deadline = started + Duration::from_millis(50);
-        let result = run_request(deadline, futures::future::pending(), rx, target(), started).await;
+        let result = run_request(
+            deadline,
+            futures::future::pending(),
+            rx,
+            target(),
+            0,
+            started,
+        )
+        .await;
         let reply = result.expect("timed out reply");
         assert_eq!(reply.status(), IcmpEchoStatus::TimedOut);
+        assert_eq!(reply.outcome(), IcmpOutcome::LocalTimeout);
+        assert_eq!(reply.sequence(), Some(0));
         assert!(started.elapsed() < Duration::from_millis(150));
         assert_completed_at_deadline(&reply, deadline);
 
@@ -1465,10 +1821,11 @@ mod tests {
         let (_tx, rx) = oneshot::channel();
         let started = Instant::now();
         let deadline = started + Duration::from_millis(50);
-        let reply = run_request(deadline, async { Ok(()) }, rx, target(), started)
+        let reply = run_request(deadline, async { Ok(()) }, rx, target(), 0, started)
             .await
             .unwrap();
         assert_eq!(reply.status(), IcmpEchoStatus::TimedOut);
+        assert_eq!(reply.outcome(), IcmpOutcome::LocalTimeout);
         let elapsed = started.elapsed();
         assert!(elapsed >= Duration::from_millis(45) && elapsed < Duration::from_millis(150));
         assert_completed_at_deadline(&reply, deadline);
@@ -1491,6 +1848,7 @@ mod tests {
             async { Ok(()) },
             rx,
             target(),
+            0,
             started,
         )
         .await
@@ -1508,11 +1866,13 @@ mod tests {
             async { Err(io::Error::from(io::ErrorKind::HostUnreachable)) },
             rx,
             target(),
+            0,
             started,
         )
         .await
         .unwrap();
         assert_eq!(reply.status(), IcmpEchoStatus::Unreachable);
+        assert_eq!(reply.outcome(), IcmpOutcome::HostUnreachable);
         let now = std::time::Instant::now();
         assert!(
             started.into_std() <= reply.completed_at() && reply.completed_at() <= now,
@@ -1525,6 +1885,7 @@ mod tests {
             async { Err(io::Error::other("boom")) },
             rx,
             target(),
+            0,
             started,
         )
         .await;
@@ -1544,11 +1905,13 @@ mod tests {
             },
             rx,
             target(),
+            0,
             started,
         )
         .await
         .unwrap();
         assert_eq!(reply.status(), IcmpEchoStatus::TimedOut);
+        assert_eq!(reply.outcome(), IcmpOutcome::LocalTimeout);
         assert!(started.elapsed() < Duration::from_millis(150));
         assert_completed_at_deadline(&reply, deadline);
     }
@@ -1563,6 +1926,7 @@ mod tests {
             async { Ok(()) },
             rx,
             target(),
+            0,
             started,
         )
         .await;
@@ -1665,7 +2029,7 @@ mod tests {
                 let p = pinger.clone();
                 std::thread::spawn(move || {
                     let (tx, rx) = oneshot::channel();
-                    (p.inner.register_request(1, tx), rx)
+                    (p.inner.register_request(1, 8, tx), rx)
                 })
             };
             std::thread::sleep(Duration::from_millis(1));
@@ -1706,7 +2070,7 @@ mod tests {
 
     #[test]
     fn wake_action_table() {
-        assert_eq!(wake_action(&Ok(64)), WakeAction::Datagram);
+        assert_eq!(wake_action(&Ok((64, None))), WakeAction::Datagram);
         assert_eq!(
             wake_action(&err(io::ErrorKind::WouldBlock)),
             WakeAction::DrainAndContinue
@@ -1872,6 +2236,7 @@ mod tests {
             let mut state = test_state();
             let (seq, mut rx) = register(&state, 1);
             let calls = std::cell::Cell::new(0);
+            let responder = "127.0.0.2".parse::<IpAddr>().unwrap();
             let mut drain = || {
                 calls.set(calls.get() + 1);
                 Drained {
@@ -1880,6 +2245,8 @@ mod tests {
                         identifier: TEST_IDENTIFIER,
                         sequence: seq,
                         status: IcmpEchoStatus::Unreachable,
+                        outcome: IcmpOutcome::DestinationUnreachable,
+                        responder: Some(responder),
                     }],
                 }
             };
@@ -1890,6 +2257,7 @@ mod tests {
             assert_eq!(calls.get(), 1, "drainer called exactly once ({kind:?})");
             let reply = rx.try_recv().unwrap().expect("waiter resolved");
             assert_eq!(reply.status(), IcmpEchoStatus::Unreachable);
+            assert_eq!(reply.responder(), Some(responder));
             assert!(
                 before <= reply.completed_at() && reply.completed_at() <= after,
                 "completed_at must be stamped at delivery ({kind:?})"
@@ -1919,7 +2287,7 @@ mod tests {
         buf[..datagram.len()].copy_from_slice(&datagram);
         let mut drain = || panic!("drainer must not be called for a datagram");
         let before = std::time::Instant::now();
-        let step = handle_wake(&mut state, Ok(datagram.len()), &buf, &mut drain);
+        let step = handle_wake(&mut state, Ok((datagram.len(), None)), &buf, &mut drain);
         let after = std::time::Instant::now();
         assert_eq!(step, RouterStep::Continue);
         let reply = rx.try_recv().unwrap().expect("echo reply delivered");
@@ -1936,7 +2304,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     mod linux {
         use super::*;
-        use crate::platform::socket::errqueue::parse_extended_error;
+        use crate::platform::socket::errqueue::{
+            parse_extended_error, parse_extended_error_with_code,
+        };
 
         fn embedded_echo(is_v6: bool, identifier: u16, sequence: u16) -> Vec<u8> {
             let mut d = vec![if is_v6 { 128u8 } else { 8u8 }, 0, 0, 0];
@@ -1963,7 +2333,7 @@ mod tests {
                     .unwrap();
             assert_eq!(
                 (info.identifier, info.sequence, info.status),
-                (3, 4, IcmpEchoStatus::TimedOut)
+                (3, 4, IcmpEchoStatus::Unreachable)
             );
             let info =
                 parse_extended_error(libc::SO_EE_ORIGIN_ICMP6, 1, &embedded_echo(true, 5, 6), v6)
@@ -1977,7 +2347,7 @@ mod tests {
                     .unwrap();
             assert_eq!(
                 (info.identifier, info.sequence, info.status),
-                (7, 8, IcmpEchoStatus::TimedOut)
+                (7, 8, IcmpEchoStatus::Unreachable)
             );
             // Parameter Problem (v4 type 12) and Packet Too Big / Parameter Problem
             // (v6 types 2 / 4) resolve the request as Unknown instead of being dropped.
@@ -2041,6 +2411,24 @@ mod tests {
             assert!(parse_extended_error(libc::SO_EE_ORIGIN_ICMP, 3, &reply, v4).is_none());
         }
 
+        #[test]
+        fn parse_extended_error_preserves_code_and_responder() {
+            let target: IpAddr = "127.0.0.1".parse().unwrap();
+            let responder: IpAddr = "192.0.2.1".parse().unwrap();
+            let info = parse_extended_error_with_code(
+                libc::SO_EE_ORIGIN_ICMP,
+                3,
+                1,
+                Some(responder),
+                &embedded_echo(false, 21, 22),
+                target,
+            )
+            .unwrap();
+            assert_eq!(info.outcome, IcmpOutcome::HostUnreachable);
+            assert_eq!(info.status, IcmpEchoStatus::Unreachable);
+            assert_eq!(info.responder, Some(responder));
+        }
+
         fn env_target(var: &str) -> Option<IpAddr> {
             match std::env::var(var) {
                 Ok(v) => Some(v.parse().expect("valid IP address")),
@@ -2063,13 +2451,13 @@ mod tests {
                 (
                     "PING_ASYNC_UNREACHABLE_TARGET",
                     None,
-                    IcmpEchoStatus::Unreachable,
+                    IcmpOutcome::HostUnreachable,
                     timeout,
                 ),
                 (
                     "PING_ASYNC_TTL1_TARGET",
                     Some(1u8),
-                    IcmpEchoStatus::TimedOut,
+                    IcmpOutcome::TimeExceeded,
                     Duration::from_secs(1),
                 ),
             ];
@@ -2084,7 +2472,7 @@ mod tests {
                     let reply = pinger.send().await.unwrap();
                     let elapsed = started.elapsed();
                     println!("{var} round {round}: {reply:?} after {elapsed:?}");
-                    assert_eq!(reply.status(), expected, "{var} round {round}");
+                    assert_eq!(reply.outcome(), expected, "{var} round {round}");
                     assert!(elapsed < bound, "{var} round {round} took {elapsed:?}");
                     assert_eq!(registry_len(&pinger), 0);
                 }
@@ -2105,14 +2493,12 @@ mod tests {
         /// Every request must resolve through its own ICMP error with exactly the
         /// `expected` status — never through the local timeout (a swallowed `sk_err` with
         /// no following drain), never as a local `Err`, and never with another request's
-        /// status (a swallowed errno attributed to the wrong request: Time Exceeded is
-        /// EHOSTUNREACH, which would surface as `Unreachable`). Time Exceeded and the local
-        /// timeout share the `TimedOut` status, so they are told apart by elapsed time
-        /// (`bound` is well below the local timeout).
+        /// outcome. Network Time Exceeded and the local timeout are distinguished by
+        /// `IcmpOutcome`; the elapsed-time bound remains a transport qualification.
         async fn concurrent_scenario(
             target: IpAddr,
             ttl: Option<u8>,
-            expected: IcmpEchoStatus,
+            expected: IcmpOutcome,
             count: usize,
             spacing: Duration,
             bound: Duration,
@@ -2137,9 +2523,17 @@ mod tests {
             for (i, handle) in handles.into_iter().enumerate() {
                 let (reply, elapsed) = handle.await.unwrap();
                 let reply = reply.unwrap_or_else(|e| panic!("request {i}: send() errored: {e}"));
-                match reply.status() {
-                    status if status == expected && elapsed < bound => icmp_errors += 1,
-                    IcmpEchoStatus::TimedOut if elapsed >= bound => late += 1,
+                match (reply.status(), reply.outcome()) {
+                    (status, outcome)
+                        if status == expected.coarse()
+                            && outcome == expected
+                            && elapsed < bound =>
+                    {
+                        icmp_errors += 1;
+                    }
+                    (IcmpEchoStatus::TimedOut, IcmpOutcome::LocalTimeout) if elapsed >= bound => {
+                        late += 1;
+                    }
                     _ => {
                         other += 1;
                         unexpected.push((i, reply, elapsed));
@@ -2184,7 +2578,7 @@ mod tests {
                 concurrent_scenario(
                     target,
                     Some(1),
-                    IcmpEchoStatus::TimedOut,
+                    IcmpOutcome::TimeExceeded,
                     200,
                     Duration::from_millis(20),
                     Duration::from_secs(2),
@@ -2196,7 +2590,7 @@ mod tests {
                 concurrent_scenario(
                     target,
                     None,
-                    IcmpEchoStatus::Unreachable,
+                    IcmpOutcome::HostUnreachable,
                     40,
                     Duration::from_millis(100),
                     Duration::from_secs(6),

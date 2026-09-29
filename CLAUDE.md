@@ -39,12 +39,17 @@
 - Windows (native): `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features
   -- -D warnings`, `cargo build --verbose`, `cargo test --verbose`, plus
   `PING_ASYNC_V6_BLACKHOLE_TARGET=fe80::dead:beef cargo test -- --ignored ipv6_blackhole`.
+  Also `cargo clippy --all-targets --all-features --target i686-pc-windows-msvc -- -D warnings`
+  and `cargo test --target i686-pc-windows-msvc`: `windows.rs` has `cfg(target_pointer_width =
+  "32")` branches and the reply-buffer `const_assert`s differ between the two widths.
 - Linux (WSL2 works; put the target dir on the Linux filesystem):
   `net.ipv4.ping_group_range` must allow the test user (`sysctl -w
   net.ipv4.ping_group_range="0 65535"` as root; persist it via `[boot] command` in
   `/etc/wsl.conf`), then the same four commands and
   `PING_ASYNC_UNREACHABLE_TARGET=<unused on-link IPv4> PING_ASYNC_TTL1_TARGET=<remote host>
-  cargo test -- --ignored`.
+  cargo test -- --ignored`. Also `cargo clippy --all-targets --all-features --target
+  x86_64-unknown-linux-musl -- -D warnings`: musl's libc types differ from glibc's (for example
+  `cmsghdr.cmsg_len` is `u32`, not `usize`), and the `errqueue` module is compiled for both.
 - macOS from another host: `cargo check --target aarch64-apple-darwin --all-targets
   --all-features` and `cargo clippy --target aarch64-apple-darwin --all-targets --all-features
   -- -D warnings` type-check the Unix code; runtime coverage is the `macos-latest` CI job.

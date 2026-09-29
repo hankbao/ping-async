@@ -33,9 +33,9 @@ async fn main() -> std::io::Result<()> {
 }
 ```
 
-The three optional arguments of `new()` are the source address, the TTL (default 128) and the per-request timeout (default 2 seconds).
+The three optional arguments of `new()` are the source address, the TTL (default 128) and the per-request timeout (default 2 seconds). Use `IcmpEchoRequestor::with_payload_len(...)` to request an exact payload from 0 through 1024 bytes; `payload_len()` reports the configured value.
 
-Besides `destination()`, `status()` and `round_trip_time()`, a reply exposes `completed_at()`: the monotonic `Instant` at which the outcome was determined, that is, when the echo reply or the ICMP error was received and matched, or when the timeout was observed. It is meaningful for every status, whereas `round_trip_time()` carries no timing information for ICMP errors, so a caller can place a late-arriving error on its own timeline.
+Besides `destination()`, `status()` and `round_trip_time()`, a reply exposes `outcome()`, `responder()` and, on backends that expose it, `sequence()`. `responder()` is the observed reply source when available, rather than the requested target. `IcmpOutcome::LocalTimeout` identifies the request deadline, while `IcmpOutcome::TimeExceeded` identifies a received ICMP Time Exceeded message. A reply also exposes `completed_at()`: the monotonic `Instant` at which the outcome was determined, that is, when the echo reply or the ICMP error was received and matched, or when the timeout was observed. It is meaningful for every status, whereas `round_trip_time()` carries no timing information for ICMP errors, so a caller can place a late-arriving error on its own timeline.
 
 ## Example
 

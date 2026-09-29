@@ -4,7 +4,7 @@ use std::io;
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
-use ping_async::{IcmpEchoReply, IcmpEchoRequestor, IcmpEchoStatus};
+use ping_async::{IcmpEchoReply, IcmpEchoRequestor, IcmpEchoStatus, IcmpOutcome};
 
 /// Asserts that the reply's completion instant lies between `before` (taken before the
 /// `send()` that produced it) and now.
@@ -27,6 +27,15 @@ fn assert_loopback_success(reply: &IcmpEchoReply, what: &str) {
         IcmpEchoStatus::Success,
         "{what}: loopback echo did not succeed: {reply:?}"
     );
+    assert_eq!(reply.outcome(), IcmpOutcome::EchoReply, "{what}");
+    assert_eq!(
+        reply.responder(),
+        Some("127.0.0.1".parse().unwrap()),
+        "{what}"
+    );
+    if cfg!(not(windows)) {
+        assert!(reply.sequence().is_some(), "{what}");
+    }
 }
 
 /// Test that multiple IcmpEchoRequestor instances can target the same IP
@@ -151,6 +160,7 @@ async fn test_timeout_behavior() {
     match result.status() {
         // No reply at all: the local timeout must fire, and within reasonable time.
         IcmpEchoStatus::TimedOut => {
+            assert_eq!(result.outcome(), IcmpOutcome::LocalTimeout);
             assert!(
                 elapsed >= Duration::from_millis(500),
                 "Should wait at least 500ms"
@@ -176,6 +186,7 @@ async fn test_timeout_behavior() {
         // A gateway that rejects the documentation prefix answers with an ICMP error,
         // which is delivered as Unreachable — before the local timeout, on every platform.
         IcmpEchoStatus::Unreachable => {
+            assert_ne!(result.outcome(), IcmpOutcome::LocalTimeout);
             assert!(
                 elapsed < Duration::from_millis(1500),
                 "ICMP error must arrive before the local timeout"

@@ -5,7 +5,7 @@ use std::convert::TryFrom;
 use std::io;
 use std::net::IpAddr;
 
-use crate::IcmpEchoStatus;
+use crate::{IcmpEchoStatus, IcmpOutcome};
 
 // ICMP error message type codes
 const ICMPV4_DEST_UNREACHABLE: u8 = 3;
@@ -27,11 +27,20 @@ const IP_PROTO_ICMPV6: u8 = 58;
 // Fixed IPv6 header length
 const IPV6_HEADER_LEN: usize = 40;
 
+const ICMP_CODE_NET_UNREACHABLE: u8 = 0;
+const ICMP_CODE_HOST_UNREACHABLE: u8 = 1;
+const ICMP_CODE_PROTOCOL_UNREACHABLE: u8 = 2;
+const ICMP_CODE_PORT_UNREACHABLE: u8 = 3;
+const ICMPV6_CODE_NO_ROUTE: u8 = 0;
+const ICMPV6_CODE_PORT_UNREACHABLE: u8 = 4;
+
 /// Information extracted from an ICMP error message that embeds an original echo request.
 pub struct IcmpErrorInfo {
     pub identifier: u16,
     pub sequence: u16,
     pub status: IcmpEchoStatus,
+    pub outcome: IcmpOutcome,
+    pub responder: Option<std::net::IpAddr>,
 }
 
 /// ICMP message types for echo request/reply operations.
@@ -371,8 +380,17 @@ impl IcmpPacket {
 
         let icmp_data = &data[outer_offset..];
 
-        // Determine status from ICMP error type
-        let status = Self::error_status(target_addr, icmp_data[0])?;
+        let icmp_type = icmp_data[0];
+        let icmp_code = icmp_data[1];
+        let outcome = Self::error_outcome(target_addr, icmp_type, icmp_code)?;
+        let status = outcome.coarse();
+        let responder = if cfg!(target_os = "macos") && target_addr.is_ipv4() {
+            data.get(12..16).map(|octets| {
+                std::net::Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3]).into()
+            })
+        } else {
+            None
+        };
 
         // Skip the 8-byte ICMP error header to reach the embedded original packet
         let embedded = &icmp_data[8..];
@@ -420,30 +438,55 @@ impl IcmpPacket {
             identifier,
             sequence,
             status,
+            outcome,
+            responder,
         })
     }
 
-    /// Maps the type of an ICMP *error* message to the status it means for the echo
-    /// request it embeds: Destination Unreachable -> `Unreachable`, Time Exceeded ->
-    /// `TimedOut`, and the remaining error types that embed the original request
-    /// (IPv4 Parameter Problem; ICMPv6 Packet Too Big and Parameter Problem) -> `Unknown`,
-    /// matching what the Windows driver reports for the same conditions. Any other type
-    /// (echo traffic, informational messages, Redirect, the deprecated Source Quench) is
-    /// not a failure of the request (`None`).
     pub fn error_status(target_addr: IpAddr, icmp_type: u8) -> Option<IcmpEchoStatus> {
         if target_addr.is_ipv4() {
             match icmp_type {
-                ICMPV4_DEST_UNREACHABLE => Some(IcmpEchoStatus::Unreachable),
-                ICMPV4_TIME_EXCEEDED => Some(IcmpEchoStatus::TimedOut),
+                ICMPV4_DEST_UNREACHABLE | ICMPV4_TIME_EXCEEDED => Some(IcmpEchoStatus::Unreachable),
                 ICMPV4_PARAMETER_PROBLEM => Some(IcmpEchoStatus::Unknown),
                 _ => None,
             }
         } else {
             match icmp_type {
-                ICMPV6_DEST_UNREACHABLE => Some(IcmpEchoStatus::Unreachable),
-                ICMPV6_TIME_EXCEEDED => Some(IcmpEchoStatus::TimedOut),
+                ICMPV6_DEST_UNREACHABLE | ICMPV6_TIME_EXCEEDED => Some(IcmpEchoStatus::Unreachable),
                 ICMPV6_PACKET_TOO_BIG | ICMPV6_PARAMETER_PROBLEM => Some(IcmpEchoStatus::Unknown),
                 _ => None,
+            }
+        }
+    }
+
+    /// Maps a type and code to a fine-grained outcome.
+    pub fn error_outcome(target_addr: IpAddr, icmp_type: u8, code: u8) -> Option<IcmpOutcome> {
+        Self::error_status(target_addr, icmp_type)?;
+        Some(Self::outcome_for_error(target_addr, icmp_type, code))
+    }
+
+    fn outcome_for_error(target_addr: IpAddr, icmp_type: u8, code: u8) -> IcmpOutcome {
+        if target_addr.is_ipv4() {
+            match icmp_type {
+                ICMPV4_DEST_UNREACHABLE => match code {
+                    ICMP_CODE_NET_UNREACHABLE => IcmpOutcome::NetworkUnreachable,
+                    ICMP_CODE_HOST_UNREACHABLE => IcmpOutcome::HostUnreachable,
+                    ICMP_CODE_PROTOCOL_UNREACHABLE => IcmpOutcome::ProtocolUnreachable,
+                    ICMP_CODE_PORT_UNREACHABLE => IcmpOutcome::PortUnreachable,
+                    _ => IcmpOutcome::DestinationUnreachable,
+                },
+                ICMPV4_TIME_EXCEEDED => IcmpOutcome::TimeExceeded,
+                _ => IcmpOutcome::Other,
+            }
+        } else {
+            match icmp_type {
+                ICMPV6_DEST_UNREACHABLE => match code {
+                    ICMPV6_CODE_NO_ROUTE => IcmpOutcome::NoRoute,
+                    ICMPV6_CODE_PORT_UNREACHABLE => IcmpOutcome::PortUnreachable,
+                    _ => IcmpOutcome::DestinationUnreachable,
+                },
+                ICMPV6_TIME_EXCEEDED => IcmpOutcome::TimeExceeded,
+                _ => IcmpOutcome::Other,
             }
         }
     }
@@ -608,6 +651,24 @@ mod tests {
         assert_eq!(packet.sequence(), 0x5678);
         assert_eq!(packet.payload(), &payload);
         assert_eq!(packet.data.len(), 8 + payload.len());
+    }
+
+    #[test]
+    fn request_payload_boundaries_are_exact() {
+        for target in [
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            IpAddr::V6("::1".parse().unwrap()),
+        ] {
+            for payload_len in [0, 1, 7, 8, 32, 56, 1024] {
+                let payload: Vec<u8> = (0..payload_len)
+                    .map(|index| (index as u8).wrapping_add(1))
+                    .collect();
+                let packet = IcmpPacket::new_echo_request(target, 0x1234, 0x5678, &payload);
+                assert_eq!(packet.payload().len(), payload_len);
+                assert_eq!(packet.as_bytes().len(), 8 + payload_len);
+                assert_eq!(&packet.as_bytes()[8..], payload.as_slice());
+            }
+        }
     }
 
     #[test]
@@ -799,7 +860,8 @@ mod tests {
         let info = IcmpPacket::parse_error_reply(&packet, target).unwrap();
         assert_eq!(info.identifier, 0x1234);
         assert_eq!(info.sequence, 0x0007);
-        assert_eq!(info.status, IcmpEchoStatus::TimedOut);
+        assert_eq!(info.status, IcmpEchoStatus::Unreachable);
+        assert_eq!(info.outcome, IcmpOutcome::TimeExceeded);
     }
 
     #[test]
@@ -839,7 +901,8 @@ mod tests {
         let info = IcmpPacket::parse_error_reply(&packet, target).unwrap();
         assert_eq!(info.identifier, 0x9999);
         assert_eq!(info.sequence, 0x000A);
-        assert_eq!(info.status, IcmpEchoStatus::TimedOut);
+        assert_eq!(info.status, IcmpEchoStatus::Unreachable);
+        assert_eq!(info.outcome, IcmpOutcome::TimeExceeded);
     }
 
     #[test]
@@ -918,8 +981,9 @@ mod tests {
 
         // On macOS IPv4, the raw socket includes the outer IP header
         let mut packet = Vec::new();
-        // Outer IP header (20 bytes, IHL=5)
-        packet.extend_from_slice(&make_ipv4_header(IP_PROTO_ICMP));
+        let mut outer = make_ipv4_header(IP_PROTO_ICMP);
+        outer[12..16].copy_from_slice(&[192, 0, 2, 1]);
+        packet.extend_from_slice(&outer);
         // ICMP Dest Unreachable header
         packet.extend_from_slice(&[ICMPV4_DEST_UNREACHABLE, 1, 0, 0, 0, 0, 0, 0]);
         // Embedded IP header
@@ -931,6 +995,7 @@ mod tests {
         assert_eq!(info.identifier, 0xBEEF);
         assert_eq!(info.sequence, 0x0010);
         assert_eq!(info.status, IcmpEchoStatus::Unreachable);
+        assert_eq!(info.responder, Some("192.0.2.1".parse().unwrap()));
     }
 
     #[test]
@@ -939,7 +1004,9 @@ mod tests {
         let target = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
 
         let mut packet = Vec::new();
-        packet.extend_from_slice(&make_ipv4_header(IP_PROTO_ICMP)); // outer IP header
+        let mut outer = make_ipv4_header(IP_PROTO_ICMP);
+        outer[12..16].copy_from_slice(&[192, 0, 2, 2]);
+        packet.extend_from_slice(&outer);
         packet.extend_from_slice(&[ICMPV4_TIME_EXCEEDED, 0, 0, 0, 0, 0, 0, 0]);
         packet.extend_from_slice(&make_ipv4_header(IP_PROTO_ICMP));
         packet.extend_from_slice(&make_echo_request_v4(0x1234, 0x0007));
@@ -947,7 +1014,9 @@ mod tests {
         let info = IcmpPacket::parse_error_reply(&packet, target).unwrap();
         assert_eq!(info.identifier, 0x1234);
         assert_eq!(info.sequence, 0x0007);
-        assert_eq!(info.status, IcmpEchoStatus::TimedOut);
+        assert_eq!(info.status, IcmpEchoStatus::Unreachable);
+        assert_eq!(info.outcome, IcmpOutcome::TimeExceeded);
+        assert_eq!(info.responder, Some("192.0.2.2".parse().unwrap()));
     }
 
     #[test]
@@ -1012,6 +1081,47 @@ mod tests {
         assert!(IcmpPacket::parse_error_reply(&packet, target).is_none());
     }
     #[test]
+    fn error_outcome_mapping_preserves_codes() {
+        let v4: IpAddr = "127.0.0.1".parse().unwrap();
+        let v6: IpAddr = "::1".parse().unwrap();
+        for (target, icmp_type, code, expected) in [
+            (
+                v4,
+                ICMPV4_DEST_UNREACHABLE,
+                0,
+                IcmpOutcome::NetworkUnreachable,
+            ),
+            (v4, ICMPV4_DEST_UNREACHABLE, 1, IcmpOutcome::HostUnreachable),
+            (
+                v4,
+                ICMPV4_DEST_UNREACHABLE,
+                2,
+                IcmpOutcome::ProtocolUnreachable,
+            ),
+            (v4, ICMPV4_DEST_UNREACHABLE, 3, IcmpOutcome::PortUnreachable),
+            (
+                v4,
+                ICMPV4_DEST_UNREACHABLE,
+                9,
+                IcmpOutcome::DestinationUnreachable,
+            ),
+            (v4, ICMPV4_TIME_EXCEEDED, 0, IcmpOutcome::TimeExceeded),
+            (v6, ICMPV6_DEST_UNREACHABLE, 0, IcmpOutcome::NoRoute),
+            (v6, ICMPV6_DEST_UNREACHABLE, 4, IcmpOutcome::PortUnreachable),
+            (v6, ICMPV6_TIME_EXCEEDED, 0, IcmpOutcome::TimeExceeded),
+        ] {
+            assert_eq!(
+                IcmpPacket::error_outcome(target, icmp_type, code),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            IcmpPacket::error_outcome(v4, ICMPV4_PARAMETER_PROBLEM, 0),
+            Some(IcmpOutcome::Other)
+        );
+    }
+
+    #[test]
     fn test_error_status_mapping() {
         let v4: IpAddr = "127.0.0.1".parse().unwrap();
         let v6: IpAddr = "::1".parse().unwrap();
@@ -1021,7 +1131,7 @@ mod tests {
         );
         assert_eq!(
             IcmpPacket::error_status(v4, ICMPV4_TIME_EXCEEDED),
-            Some(IcmpEchoStatus::TimedOut)
+            Some(IcmpEchoStatus::Unreachable)
         );
         assert_eq!(
             IcmpPacket::error_status(v6, ICMPV6_DEST_UNREACHABLE),
@@ -1029,7 +1139,7 @@ mod tests {
         );
         assert_eq!(
             IcmpPacket::error_status(v6, ICMPV6_TIME_EXCEEDED),
-            Some(IcmpEchoStatus::TimedOut)
+            Some(IcmpEchoStatus::Unreachable)
         );
         // Other error types that embed the original request are reported as Unknown
         assert_eq!(
@@ -1057,7 +1167,7 @@ mod tests {
         // Source Quench, v6 type 4 is Parameter Problem)
         assert_eq!(
             IcmpPacket::error_status(v6, ICMPV4_DEST_UNREACHABLE),
-            Some(IcmpEchoStatus::TimedOut)
+            Some(IcmpEchoStatus::Unreachable)
         );
         assert_eq!(IcmpPacket::error_status(v4, ICMPV6_DEST_UNREACHABLE), None);
         assert_eq!(IcmpPacket::error_status(v4, ICMPV6_PARAMETER_PROBLEM), None);

@@ -18,6 +18,16 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         rust: [stable]
+        include:
+          # Extra targets the code claims to support but the native host does not cover:
+          # 32-bit Windows (cfg(target_pointer_width = "32") in windows.rs) and musl
+          # (a different libc: cmsghdr.cmsg_len is u32, not usize).
+          - os: ubuntu-latest
+            extra_target: x86_64-unknown-linux-musl
+            extra_target_tests: false
+          - os: windows-latest
+            extra_target: i686-pc-windows-msvc
+            extra_target_tests: true
 
     steps:
       - uses: actions/checkout@v4
@@ -31,6 +41,7 @@ jobs:
         with:
           toolchain: ${{ matrix.rust }}
           components: rustfmt, clippy
+          targets: ${{ matrix.extra_target }}
 
       - name: Cache dependencies
         uses: Swatinem/rust-cache@v2
@@ -46,6 +57,14 @@ jobs:
 
       - name: Run tests
         run: cargo test --verbose
+
+      - name: Run clippy (${{ matrix.extra_target }})
+        if: matrix.extra_target != ''
+        run: cargo clippy --all-targets --all-features --target ${{ matrix.extra_target }} -- -D warnings
+
+      - name: Run tests (${{ matrix.extra_target }})
+        if: matrix.extra_target_tests
+        run: cargo test --verbose --target ${{ matrix.extra_target }}
 
   security:
     name: Security audit
